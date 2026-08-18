@@ -45,6 +45,7 @@ Registrar no núcleo **Orion** o suporte oficial às três stacks de animação/
 - [x] Registro no install-manifest (`install-manifest.yaml` + hash/size)
 - [x] Registro no wizard do installer (lista de presets)
 - [x] Comando CLI `aiox preset list|show` (`.aiox-core/cli/commands/preset/`)
+- [x] Skill `orion-motion` (auto-detecção de motion/3D ao criar páginas)
 
 ### Wave 1 — Boilerplates (só se o repo tiver estrutura de templates)
 

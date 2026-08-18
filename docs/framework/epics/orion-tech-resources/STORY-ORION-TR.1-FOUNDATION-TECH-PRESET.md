@@ -70,6 +70,7 @@ Registrar no núcleo **Orion** o tech preset `gsap-three-motion` — a combinaç
 | `.aiox-core/cli/commands/preset/index.js` | CREATE |
 | `.aiox-core/cli/index.js` | UPDATE (+preset command) |
 | `bin/aiox.js` | UPDATE (+preset case + help) |
+| `.claude/skills/orion-motion/SKILL.md` | CREATE (auto-detecção motion/3D) |
 | `docs/framework/epics/orion-tech-resources/EPIC-ORION-TECH-RESOURCES.md` | CREATE |
 | `docs/framework/epics/orion-tech-resources/STORY-ORION-TR.1-FOUNDATION-TECH-PRESET.md` | CREATE |
 
@@ -87,6 +88,7 @@ Registrar no núcleo **Orion** o tech preset `gsap-three-motion` — a combinaç
 - [x] Registro no install-manifest (hash + size)
 - [x] Registro no wizard do installer (questions.js)
 - [x] Comando CLI `aiox preset list|show` (CLI First — Constitution I)
+- [x] Skill `orion-motion` — auto-detecção de motion/3D (`.claude/skills/orion-motion/`)
 - [ ] Validação @po (10-point)
 - [ ] QA gate
 - [ ] Done
