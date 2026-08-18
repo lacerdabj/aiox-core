@@ -77,6 +77,8 @@ USAGE:
   aiox sdc plan <story.md>          # Lean full-sdc plan/progress
   aiox sdc next <story-id>          # Next SDC phase + skill
   aiox wave plan --stories a,b      # Lean wave-execute DAG plan
+  aiox preset list                  # List tech presets
+  aiox preset show <preset-id>      # Show a tech preset
   aiox-delegate codex -t <slug>     # Delegate implementation to external executor
   npx aiox-core@latest enterprise upgrade --target . --dry-run --enterprise-source <path>
                                        # Plan Pro to Enterprise upgrade
@@ -947,6 +949,17 @@ async function main() {
     case 'enterprise':
       // AIOX Enterprise Upgrade Planning - Story PEM.1
       await runEnterprise();
+      break;
+
+    case 'preset':
+      // Tech Presets — ORION-TR.1 (GSAP, Three.js, Motion.dev)
+      try {
+        const { run } = require('../.aiox-core/cli/index.js');
+        await run(process.argv);
+      } catch (error) {
+        console.error(`❌ Preset command error: ${error.message}`);
+        process.exit(1);
+      }
       break;
 
     case 'install': {

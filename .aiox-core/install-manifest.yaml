@@ -1424,6 +1424,10 @@ files:
     hash: sha256:e0851caecbdc2cea6531359fe640427685cd6ed664dbf991ccb135917c4d1ec2
     type: data
     size: 11080
+  - path: data/tech-presets/gsap-three-motion.md
+    hash: sha256:70b28156063e093aa03b4db66cde06c1d23c4fa7dd5d8d10dfca5cc000f9513d
+    type: data
+    size: 16814
   - path: data/tech-presets/java.md
     hash: sha256:b912e04412f63b59439f7cca119802bed95a6cb756221e3ba7aee45c3d2890fd
     type: data

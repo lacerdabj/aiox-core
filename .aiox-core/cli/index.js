@@ -25,6 +25,7 @@ const { createConfigCommand } = require('./commands/config');
 const { createProCommand } = require('./commands/pro');
 const { createSdcCommand } = require('./commands/sdc');
 const { createWaveCommand } = require('./commands/wave');
+const { createPresetCommand } = require('./commands/preset');
 
 // Read package.json for version
 const packageJsonPath = path.join(__dirname, '..', '..', 'package.json');
@@ -60,6 +61,7 @@ Commands:
   mcp               Manage global MCP configuration
   migrate           Migrate from v2.0 to v4.0.4 structure
   generate          Generate documents from templates (prd, adr, pmdr, etc.)
+  preset            Browse and inspect tech presets (list, show)
   install           Install AIOX in current project
   init <name>       Create new AIOX project
   info              Show system information
@@ -102,6 +104,8 @@ Examples:
   $ aiox sdc verify docs/stories/1.1.story.md develop --mark
   $ aiox wave plan --stories a.md,b.md --wave-id W1 --save
   $ aiox wave next W1
+  $ aiox preset list
+  $ aiox preset show gsap-three-motion
   $ aiox install
   $ aiox doctor
 `);
@@ -136,6 +140,9 @@ Examples:
   // Lean full-sdc + wave-execute (CORE-SUPER-UPDATE Wave B execute)
   program.addCommand(createSdcCommand());
   program.addCommand(createWaveCommand());
+
+  // Tech presets (ORION-TR.1)
+  program.addCommand(createPresetCommand());
 
   return program;
 }

@@ -258,6 +258,12 @@ function getTechPresetQuestion() {
           value: 'go',
         },
         {
+          name:
+            colors.highlight('gsap-three-motion') +
+            colors.dim(' - GSAP v3, Three.js, Motion.dev — animation & 3D stack'),
+          value: 'gsap-three-motion',
+        },
+        {
           name: colors.highlight('java') + colors.dim(' - Java 21+ with Spring Boot'),
           value: 'java',
         },
