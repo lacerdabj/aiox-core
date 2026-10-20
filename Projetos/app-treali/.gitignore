@@ -1,6 +1,8 @@
-node_modules/
-dist/
+node_modules
+dist
+.treali-data
 .env
 .env.local
-.vercel/
-api/data/catalogs.generated.ts
+.env.*.local
+.DS_Store
+*.log

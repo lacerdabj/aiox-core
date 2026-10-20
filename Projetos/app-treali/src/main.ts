@@ -1,561 +1,1434 @@
 import './styles.css'
-import { getClients, getSession, login, logout } from './api'
-import { createManualClient, loadManualClients, saveManualClients, validateNewClient, type KeyValueStorage, type NewClientError } from './client-store'
-import { assertAttendanceAction, createAttendanceRecord } from './domain'
-import { capturePosition } from './gps'
-import { AttendanceStorage } from './storage'
-import { ATTENDANCE_ACTIONS, type AttendanceRecord, type Client, type SessionContext } from './types'
+import { icons } from './icons'
+import type {
+  ClientPDV,
+  DailySummary,
+  Distributor,
+  DistributorSession,
+  FlavorId,
+  OrderRecord,
+  PaymentMethod,
+  ProductFlavor
+} from './types'
+import {
+  getAllClients,
+  getAllOrders,
+  getDailySummary,
+  saveClient,
+  saveOrder,
+  getDistributorProductPrices, saveDistributorProductPrice, getAllProducts
+} from './db'
+import { eligibleProducts, buildOrderItems } from './pricing'
+import {
+  initSyncEngine,
+  onSyncStatusChange,
+  syncPendingData,
+  pullRemoteCatalog,
+  discardUnavailablePrice
+} from './sync'
+import {
+  checkCurrentSession,
+  executeLogout,
+  loginWithPin
+} from './auth'
+import { broadcastSyncMessage, subscribeSyncMessages } from './channel'
+import { captureCurrentPosition, tryReverseGeocode } from './gps'
+import {
+  buildReceiptMessage,
+  formatBrazilianPhone,
+  openNavigationRoute,
+  openWhatsApp,
+  validateBrazilianMobilePhone
+} from './whatsapp'
+import { calculateRepurchaseStatus } from './commercial'
 
-const root = document.querySelector<HTMLElement>('#app')
-if (!root) throw new Error('Elemento principal não encontrado.')
-const appRoot: HTMLElement = root
-
-type AppState = {
-  session: SessionContext | null
-  clients: Client[]
-  selectedClient: Client | null
-  storage: AttendanceStorage | null
-  storageError: string | null
-  history: AttendanceRecord[]
-  menuOpen: boolean
-  route: 'home' | 'profile' | 'precos' | 'contrato' | 'documentos' | 'ocorrencias'
-  statusFilter: 'all' | 'pending' | 'attended'
-  catalog: Client[]
-  newClient: { name: string; category: string; address: string; phone: string; errors: NewClientError[]; saveError: string } | null
+const domElement = document.getElementById('app')
+if (!domElement) {
+  throw new Error('Elemento #app não encontrado no DOM.')
 }
+const appRoot: HTMLElement = domElement
 
-const state: AppState = { session: null, clients: [], selectedClient: null, storage: null, storageError: null, history: [], menuOpen: false, route: 'home', statusFilter: 'all', catalog: [], newClient: null }
+type ScreenType = 'login' | 'home' | 'order' | 'receipt'
 
-let bannerIndex = 0
-let bannerTimer: number | undefined
-
-type BannerSlide = { src: string; alt: string }
-
-function browserStorage(): KeyValueStorage | null {
-  try {
-    if (typeof localStorage === 'undefined') return null
-    return localStorage
-  } catch {
-    return null
+interface AppState {
+  session: DistributorSession | null
+  currentScreen: ScreenType
+  syncStatus: 'idle' | 'syncing' | 'error' | 'synced'
+  pendingSyncCount: number
+  distributors: Distributor[]
+  clients: ClientPDV[]
+  products: ProductFlavor[]
+  pendingPriceIds: Set<string>
+  conflictPriceIds: Set<string>
+  remoteConflictPrices: Map<string, number | null>
+  unavailablePrices: Array<{ productId: string; name: string }>
+  clientSearchQuery: string
+  todayClientOrders: Map<string, { totalPackages: number; totalAmount: number }>
+  dailySummary: DailySummary
+  // Estado da Tela 2 (Pedido)
+  orderDraft: {
+    mode: 'existing' | 'new'
+    selectedClientId: string
+    newClient: {
+      name: string
+      contactName: string
+      whatsapp: string
+      city: string
+      neighborhood: string
+      latitude?: number
+      longitude?: number
+    }
+    newClientWhatsappError?: string
+    quantities: Record<FlavorId, number>
+    paymentMethod: PaymentMethod
+    nextDelivery: string
+    isGpsLoading: boolean
+  }
+  // Estado da Tela 3 (Recibo)
+  completedOrder: OrderRecord | null
+  // Estado do Login do Distribuidor com PIN
+  loginForm: {
+    phone: string
+    name: string
+    pin: string
+    error: string
+    isLoading: boolean
+    selectedDistributorId: string
+    showCustomPhone: boolean
+    showSmsFallback: boolean
+    step: 'pin' | 'sms'
+    previewCode: string
   }
 }
 
-function refreshClients(catalog: Client[]): void {
-  state.catalog = catalog
-  const storage = state.session ? browserStorage() : null
-  const manual = storage && state.session ? loadManualClients(storage, state.session.slug) : []
-  state.clients = [...catalog, ...manual]
+const state: AppState = {
+  session: null,
+  currentScreen: 'login',
+  syncStatus: 'idle',
+  pendingSyncCount: 0,
+  distributors: [],
+  clients: [],
+  products: [],
+  pendingPriceIds: new Set(),
+  conflictPriceIds: new Set(),
+  remoteConflictPrices: new Map(),
+  unavailablePrices: [],
+  clientSearchQuery: '',
+  todayClientOrders: new Map(),
+  dailySummary: {
+    totalAmount: 0,
+    totalPackages: 0,
+    totalOrders: 0,
+    pendingSyncCount: 0
+  },
+  orderDraft: {
+    mode: 'existing',
+    selectedClientId: '',
+    newClient: {
+      name: '',
+      contactName: '',
+      whatsapp: '',
+      city: 'Muriaé',
+      neighborhood: '',
+      latitude: undefined,
+      longitude: undefined
+    },
+    newClientWhatsappError: '',
+    quantities: {
+      bacon_30g: 0,
+      creme_alho_30g: 0,
+      tradicional_30g: 0,
+      picante_30g: 0
+    },
+    paymentMethod: 'PIX_A_VISTA',
+    nextDelivery: 'Terça-feira',
+    isGpsLoading: false
+  },
+  completedOrder: null,
+  loginForm: {
+    phone: typeof localStorage !== 'undefined' ? (localStorage.getItem('treali_last_phone') || '') : '',
+    name: '',
+    pin: '',
+    error: '',
+    isLoading: false,
+    selectedDistributorId: '',
+    showCustomPhone: false,
+    showSmsFallback: false,
+    step: 'pin',
+    previewCode: ''
+  }
 }
 
-function emptyNewClient(): NonNullable<AppState['newClient']> {
-  return { name: '', category: '', address: '', phone: '', errors: [], saveError: '' }
+// Vibração tátil sutil para a "Regra do Dedo Gordo"
+function hapticFeedback(ms = 30) {
+  if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+    try {
+      navigator.vibrate(ms)
+    } catch {
+      // Ignora se não permitido pelo dispositivo
+    }
+  }
 }
 
-function bannerSlides(): BannerSlide[] {
-  return [
-    { src: '/banners/banner-maionese-rose.jpg', alt: 'Maionese Rosé Treali — mais sabor para seu lanche, ideal para fast food' },
-    { src: '/banners/banner-maionese-tradicional.jpg', alt: 'Maionese Tradicional Treali — mais sabor para seu lanche, ideal para fast food' },
-    { src: '/banners/banner-maionese-sache.jpg', alt: 'Maionese Tradicional Treali em sachê de 25ml — deixa tudo mais gostoso' },
-    { src: '/banners/banner-maionese-cebola-salsa.jpg', alt: 'Maionese Cebola e Salsa Treali — mais sabor para seu lanche, ideal para fast food' }
-  ]
+function showToast(message: string, iconSvg?: string) {
+  const existing = document.querySelector('.toast')
+  if (existing) existing.remove()
+
+  const toast = document.createElement('div')
+  toast.className = 'toast'
+  toast.innerHTML = `${iconSvg || icons.check} <span>${message}</span>`
+  document.body.appendChild(toast)
+
+  setTimeout(() => {
+    toast.remove()
+  }, 3200)
 }
 
-function escapeHtml(value: string): string {
-  return value.replace(/[&<>'"]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character] ?? character)
+async function refreshData() {
+  state.clients = await getAllClients()
+  const priceRows = state.session?.distributorId ? await getDistributorProductPrices(state.session.distributorId) : []
+  state.pendingPriceIds = new Set(priceRows.filter((row) => row.resalePendingSync).map((row) => row.productId))
+  state.conflictPriceIds = new Set(priceRows.filter((row) => row.conflict).map((row) => row.productId))
+  state.remoteConflictPrices = new Map(priceRows.filter((row) => row.conflict).map((row) => [row.productId, row.serverResalePrice ?? null]))
+  const cachedProducts = await getAllProducts()
+  state.unavailablePrices = priceRows.filter((row) => row.syncError === 'product_unavailable' && row.resalePendingSync)
+    .map((row) => ({ productId: row.productId, name: cachedProducts.find((product) => product.id === row.productId)?.name || row.productId }))
+  state.products = state.session?.distributorId
+    ? eligibleProducts(cachedProducts, priceRows)
+    : []
+  state.dailySummary = await getDailySummary()
+  state.pendingSyncCount = state.dailySummary.pendingSyncCount
+
+  // Identifica clientes que já compraram hoje e mapeia a última compra de cada um
+  const allOrders = await getAllOrders()
+  const today = new Date().toISOString().slice(0, 10)
+  const todayOrders = allOrders.filter((o) => o.createdAt.slice(0, 10) === today)
+
+  state.todayClientOrders = new Map<string, { totalPackages: number; totalAmount: number }>()
+  for (const ord of todayOrders) {
+    const current = state.todayClientOrders.get(ord.clientId) || { totalPackages: 0, totalAmount: 0 }
+    current.totalPackages += ord.totalPackages
+    current.totalAmount += ord.totalAmount
+    state.todayClientOrders.set(ord.clientId, current)
+  }
+
+  // Mapeia data do último pedido registrado para cada cliente
+  const clientLastOrderMap = new Map<string, string>()
+  for (const ord of allOrders) {
+    if (!clientLastOrderMap.has(ord.clientId)) {
+      clientLastOrderMap.set(ord.clientId, ord.createdAt)
+    }
+  }
+
+  for (const cli of state.clients) {
+    const orderDate = clientLastOrderMap.get(cli.id)
+    if (orderDate && (!cli.lastOrderDate || new Date(orderDate) > new Date(cli.lastOrderDate))) {
+      cli.lastOrderDate = orderDate
+    }
+  }
 }
 
-function render(message = ''): void {
-  stopBanner()
+// ==========================
+// RENDERIZADOR PRINCIPAL
+// ==========================
+function render() {
   if (!state.session) {
-    appRoot.innerHTML = `<section class="auth-shell"><div class="auth-card"><img src="/icons/icon-192.svg" width="72" height="72" alt="Treali" /><p class="eyebrow">Treali Alimentos</p><h1>Área do distribuidor</h1><p>Entre para acessar a carteira da sua cidade.</p><form id="login-form"><label>Login<input name="login" autocomplete="username" required /></label><label>Senha<input name="password" type="password" autocomplete="current-password" required /></label><button type="submit">Entrar</button><p class="message" role="status">${escapeHtml(message)}</p></form></div></section>`
-    document.querySelector<HTMLFormElement>('#login-form')?.addEventListener('submit', onLogin)
+    renderLoginScreen()
     return
   }
 
-  const session = state.session
-  const route = state.route
-  const isHome = !state.selectedClient && route === 'home'
-  const slides = bannerSlides()
-  bannerIndex = bannerIndex % slides.length
-  const content = state.selectedClient
-    ? detailTemplate(state.selectedClient, message)
-    : route === 'profile'
-      ? profileTemplate()
-      : route === 'home'
-        ? `<div id="home-results" aria-live="off">${resultsTemplate(message)}</div>`
-        : infoTemplate(route)
-  appRoot.innerHTML = `<header class="topbar"><button class="menu-button" id="menu-toggle" type="button" aria-expanded="${state.menuOpen ? 'true' : 'false'}" aria-controls="app-menu" aria-label="Abrir menu">☰</button><a class="brand" href="#" aria-label="Voltar para clientes"><img src="/icons/icon-192.svg" width="40" height="40" alt="" />Treali</a><div><span>${escapeHtml(session.label)}</span></div></header>${isHome ? `${bannerTemplate(slides, bannerIndex)}${iconbarTemplate()}${progressTemplate()}` : ''}<div class="scrim${state.menuOpen ? ' visible' : ''}" id="scrim"></div><nav class="drawer${state.menuOpen ? ' open' : ''}" id="app-menu" aria-label="Menu do distribuidor"><span class="avatar" aria-hidden="true">${escapeHtml(avatarInitials(session.label))}</span><p class="drawer-title">${escapeHtml(session.label)}</p><small>📍 ${escapeHtml(session.cityId)}</small><button class="drawer-item" data-nav="home" type="button">Carteira de clientes</button><button class="drawer-item" data-nav="new-client" type="button">Novo Cliente</button><button class="drawer-item" data-nav="profile" type="button">Perfil</button><button class="drawer-item" data-nav="precos" type="button">Preços</button><button class="drawer-item" data-nav="contrato" type="button">Contrato</button><button class="drawer-item" data-nav="documentos" type="button">Documentos</button><div class="drawer-gap" aria-hidden="true"></div><button class="drawer-item" data-nav="ocorrencias" type="button">Ocorrências</button><button class="drawer-item" data-nav="logout" type="button">Sair</button></nav><main class="content">${content}</main>${bottomNavTemplate(isHome)}${state.newClient ? newClientModalTemplate() : ''}`
-  document.querySelector<HTMLButtonElement>('#menu-toggle')?.addEventListener('click', toggleMenu)
-  document.querySelector<HTMLDivElement>('#scrim')?.addEventListener('click', closeMenu)
-  document.querySelectorAll<HTMLButtonElement>('[data-nav]').forEach((button) => button.addEventListener('click', () => onNavigate(button.dataset.nav ?? '')))
-  document.querySelectorAll<HTMLButtonElement>('[data-bottom]').forEach((button) => button.addEventListener('click', () => onBottomNav(button.dataset.bottom ?? '')))
-  document.querySelector<HTMLAnchorElement>('.brand')?.addEventListener('click', (event) => { event.preventDefault(); state.selectedClient = null; state.route = 'home'; render() })
-  if (isHome) bindHomeControls()
-  bindViewEvents()
-  bindBanner()
-  startBanner()
-  document.querySelector<HTMLFormElement>('#new-client-form')?.addEventListener('submit', onSaveNewClient)
-  document.querySelector<HTMLButtonElement>('#new-client-cancel')?.addEventListener('click', closeNewClient)
-  document.querySelector<HTMLDivElement>('#new-client-backdrop')?.addEventListener('click', (event) => {
-    if (event.target === event.currentTarget) closeNewClient()
-  })
-}
-
-function bottomNavTemplate(isHome: boolean): string {
-  return `<nav class="bottomnav" aria-label="Navegação principal"><button class="bottom-item${isHome ? ' active' : ''}" data-bottom="home" type="button"${isHome ? ' aria-current="page"' : ''}><span aria-hidden="true">⌂</span><small>Início</small></button><button class="bottom-item" data-bottom="menu" type="button"><span aria-hidden="true">☰</span><small>Menu</small></button><button class="bottom-item" data-bottom="logout" type="button"><span aria-hidden="true">⏻</span><small>Sair</small></button></nav>`
-}
-
-function onBottomNav(target: string): void {
-  if (target === 'logout') {
-    void onLogout()
-    return
-  }
-  if (target === 'menu') {
-    state.menuOpen = true
-    applyMenuState()
-    return
-  }
-  state.selectedClient = null
-  state.route = 'home'
-  render()
-  window.scrollTo({ top: 0 })
-}
-
-function syncOptionState(selector: string, attribute: string, value: string): void {
-  document.querySelectorAll<HTMLButtonElement>(selector).forEach((button) => {
-    const active = button.dataset[attribute] === value
-    button.classList.toggle('active', active)
-    if (active) button.setAttribute('aria-current', 'true')
-    else button.removeAttribute('aria-current')
-  })
-}
-
-function bindHomeControls(): void {
-  document.querySelectorAll<HTMLButtonElement>('[data-iconbar]').forEach((button) => button.addEventListener('click', () => onIconbar(button.dataset.iconbar ?? '')))
-  bindShortcuts()
-}
-
-function bindShortcuts(): void {
-  document.querySelectorAll<HTMLButtonElement>('[data-status]').forEach((button) => button.addEventListener('click', () => {
-    const next = button.dataset.status
-    state.statusFilter = next === 'pending' || next === 'attended' ? next : 'all'
-    syncOptionState('[data-status]', 'status', state.statusFilter)
-    renderResults()
-  }))
-}
-
-function renderResults(message = ''): void {
-  const container = document.querySelector<HTMLElement>('#home-results')
-  if (!container) return
-  container.innerHTML = resultsTemplate(message)
-  bindClientCards()
-  bindShortcuts()
-}
-
-function bannerTemplate(slides: BannerSlide[], active: number): string {
-  const items = slides.map((slide, index) =>
-    `<div class="slide${index === active ? ' active' : ''}" role="group" aria-roledescription="slide" aria-label="${index + 1} de ${slides.length}"${index === active ? '' : ' hidden'}><img src="${slide.src}" alt="${escapeHtml(slide.alt)}" loading="${index === active ? 'eager' : 'lazy'}" /></div>`
-  ).join('')
-  const dots = slides.map((_, index) =>
-    `<button class="dot${index === active ? ' active' : ''}" data-slide="${index}" type="button" aria-label="Ir para aviso ${index + 1}"${index === active ? ' aria-current="true"' : ''}></button>`
-  ).join('')
-  return `<section class="banner" id="banner" aria-roledescription="carousel" aria-label="Avisos" aria-live="off"><div class="banner-viewport">${items}</div><button class="banner-nav" data-banner="prev" type="button" aria-label="Aviso anterior">‹</button><button class="banner-nav" data-banner="next" type="button" aria-label="Próximo aviso">›</button><div class="dots">${dots}</div></section>`
-}
-
-function setBannerSlide(index: number): void {
-  const banner = document.querySelector<HTMLElement>('#banner')
-  if (!banner) return
-  const slides = banner.querySelectorAll<HTMLElement>('.slide')
-  if (slides.length === 0) return
-  bannerIndex = (index + slides.length) % slides.length
-  slides.forEach((slide, position) => {
-    const active = position === bannerIndex
-    slide.classList.toggle('active', active)
-    if (active) slide.removeAttribute('hidden')
-    else slide.setAttribute('hidden', '')
-  })
-  banner.querySelectorAll<HTMLButtonElement>('.dot').forEach((dot, position) => {
-    const active = position === bannerIndex
-    dot.classList.toggle('active', active)
-    if (active) dot.setAttribute('aria-current', 'true')
-    else dot.removeAttribute('aria-current')
-  })
-}
-
-function stopBanner(): void {
-  if (bannerTimer !== undefined) {
-    window.clearInterval(bannerTimer)
-    bannerTimer = undefined
+  switch (state.currentScreen) {
+    case 'home':
+      renderHomeScreen()
+      break
+    case 'order':
+      renderOrderScreen()
+      break
+    case 'receipt':
+      renderReceiptScreen()
+      break
+    default:
+      renderHomeScreen()
   }
 }
 
-function startBanner(): void {
-  stopBanner()
-  const banner = document.querySelector<HTMLElement>('#banner')
-  if (!banner) return
-  const total = banner.querySelectorAll('.slide').length
-  if (total < 2 || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return
-  const pause = (): void => stopBanner()
-  const resume = (): void => {
-    if (bannerTimer === undefined) bannerTimer = window.setInterval(() => setBannerSlide(bannerIndex + 1), 6000)
+// ==========================
+// HEADER COM BARRA DE STATUS
+// ==========================
+function createHeaderHTML(): string {
+  const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true
+  let syncBadgeClass = 'online'
+  let syncBadgeText = 'Online'
+
+  if (!isOnline) {
+    syncBadgeClass = 'offline'
+    syncBadgeText = `Offline (${state.pendingSyncCount})`
+  } else if (state.syncStatus === 'syncing') {
+    syncBadgeClass = 'syncing'
+    syncBadgeText = 'Sincronizando...'
+  } else if (state.pendingSyncCount > 0) {
+    syncBadgeClass = 'offline'
+    syncBadgeText = `${state.pendingSyncCount} pendente(s)`
   }
-  banner.addEventListener('mouseenter', pause)
-  banner.addEventListener('mouseleave', resume)
-  banner.addEventListener('focusin', pause)
-  banner.addEventListener('focusout', resume)
-  resume()
+
+  return `
+    <header class="app-header">
+      <div class="brand-wrapper">
+        <div class="brand-title">TREALI</div>
+        <div class="brand-sub">MODO RUA</div>
+      </div>
+      <div class="header-actions">
+        <div class="sync-badge ${syncBadgeClass}">
+          ${syncBadgeClass === 'syncing' ? icons.refresh : icons.check}
+          <span>${syncBadgeText}</span>
+        </div>
+        <a href="/dashboard.html" class="btn-icon-header" title="Abrir Painel da Fábrica" aria-label="Painel da Fábrica" style="text-decoration:none; display:flex; align-items:center; justify-content:center; font-size:16px;">
+          🏢
+        </a>
+        <button id="btn-logout" class="btn-icon-header" title="Sair da Conta" aria-label="Sair">
+          ${icons.logout}
+        </button>
+      </div>
+    </header>
+  `
 }
 
-function bindBanner(): void {
-  document.querySelectorAll<HTMLButtonElement>('[data-banner]').forEach((button) => button.addEventListener('click', () => {
-    stopBanner()
-    setBannerSlide(bannerIndex + (button.dataset.banner === 'next' ? 1 : -1))
-    startBanner()
-  }))
-  document.querySelectorAll<HTMLButtonElement>('.dot').forEach((dot) => dot.addEventListener('click', () => {
-    stopBanner()
-    setBannerSlide(Number(dot.dataset.slide ?? '0'))
-    startBanner()
-  }))
-}
-
-function toggleMenu(): void {
-  state.menuOpen = !state.menuOpen
-  applyMenuState()
-}
-
-function closeMenu(): void {
-  if (!state.menuOpen) return
-  state.menuOpen = false
-  applyMenuState()
-}
-
-function applyMenuState(): void {
-  document.querySelector<HTMLElement>('#app-menu')?.classList.toggle('open', state.menuOpen)
-  document.querySelector<HTMLDivElement>('#scrim')?.classList.toggle('visible', state.menuOpen)
-  document.querySelector<HTMLButtonElement>('#menu-toggle')?.setAttribute('aria-expanded', state.menuOpen ? 'true' : 'false')
-}
-
-function onNavigate(target: string): void {
-  if (target === 'logout') {
-    void onLogout()
-    return
-  }
-  if (target === 'new-client') {
-    state.selectedClient = null
-    state.route = 'home'
-    state.menuOpen = false
-    state.newClient = emptyNewClient()
-    render()
-    document.querySelector<HTMLInputElement>('#new-client-name')?.focus()
-    return
-  }
-  if (target === 'profile' || target === 'precos' || target === 'contrato' || target === 'documentos' || target === 'ocorrencias') {
-    state.selectedClient = null
-    state.route = target
-    state.menuOpen = false
-    render()
-    return
-  }
-  state.selectedClient = null
-  state.route = 'home'
-  state.menuOpen = false
-  render()
-}
-
-function currentAction(distributorId: string, clientId: string): AttendanceRecord | null {
-  try {
-    const raw = localStorage.getItem(`treali:attendance:${distributorId}:${clientId}`)
-    return raw ? JSON.parse(raw) as AttendanceRecord : null
-  } catch {
-    return null
-  }
-}
-
-function filteredClients(): Client[] {
-  if (!state.session) return []
-  return state.clients.filter((client) => {
-    const action = currentAction(state.session?.distributorId ?? '', client.id)
-    if (state.statusFilter === 'attended' && !action) return false
-    if (state.statusFilter === 'pending' && action) return false
-    return true
-  })
-}
-
-function clientCard(client: Client): string {
-  const action = state.session ? currentAction(state.session.distributorId, client.id) : null
-  const badge = action ? `<em class="badge done">${escapeHtml(action.action)}</em>` : '<em class="badge todo">Sem atendimento</em>'
-  const origin = client.origin === 'manual' ? '<em class="badge manual">Cadastro manual</em>' : ''
-  return `<button class="client-card" data-client-id="${escapeHtml(client.id)}" type="button"><span class="client-icon" aria-hidden="true">${escapeHtml(client.name.slice(0, 1).toUpperCase())}</span><span><strong>${escapeHtml(client.name)}</strong><small>${escapeHtml(client.category)}</small><small>${escapeHtml(client.address ?? 'Endereço não informado')}</small>${badge}${origin}</span><span aria-hidden="true">›</span></button>`
-}
-
-function walletProgress(): { total: number; attended: number; buyers: number } {
-  const distributorId = state.session?.distributorId ?? ''
-  let attended = 0
-  let buyers = 0
-  for (const client of state.clients) {
-    const action = currentAction(distributorId, client.id)?.action
-    if (!action) continue
-    attended += 1
-    if (action === 'Eu já atendo' || action === 'Cliente Novo Atendido') buyers += 1
-  }
-  return { total: state.clients.length, attended, buyers }
-}
-
-function progressTemplate(): string {
-  const { total, attended, buyers } = walletProgress()
-  const totalPct = total === 0 ? 0 : Math.round((attended / total) * 100)
-  const salesPct = total === 0 ? 0 : Math.round((buyers / total) * 100)
-  const bar = (label: string, value: number, pct: number, detail: string) =>
-    `<div class="bar-row"><div class="bar-head"><strong>${label}</strong><span>${value}/${total} · ${pct}%</span></div><div class="track" role="progressbar" aria-label="${label}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div class="fill" style="width:${pct}%"></div></div><small>${detail}</small></div>`
-  return `<section class="progress-card" aria-label="Progresso da carteira">${bar('Total', attended, totalPct, 'clientes com atendimento registrado')}${bar('Vendas', buyers, salesPct, 'marcados como “Eu já atendo” ou “Cliente Novo Atendido”')}</section>`
-}
-
-function shortcutsTemplate(attended: number, pending: number): string {
-  const item = (key: 'all' | 'pending' | 'attended', label: string, detail: string) =>
-    `<button class="shortcut${state.statusFilter === key ? ' active' : ''}" data-status="${key}" type="button"${state.statusFilter === key ? ' aria-current="true"' : ''}><strong>${attended + pending === 0 && key !== 'all' ? '0' : key === 'all' ? state.clients.length : key === 'attended' ? attended : pending}</strong><span>${label}</span><small>${detail}</small></button>`
-  return `<div class="shortcuts" role="group" aria-label="Atalhos da carteira">${item('all', 'Carteira', 'todos')}${item('pending', 'Sem atendimento', 'priorizar')}${item('attended', 'Atendidos', 'neste aparelho')}</div>`
-}
-
-function iconbarTemplate(): string {
-  const item = (key: string, src: string, label: string) =>
-    `<button class="iconbar-item" data-iconbar="${key}" type="button"><img src="${src}" alt="" width="56" height="56" loading="lazy" /><small>${label}</small></button>`
-  return `<div class="iconbar" role="group" aria-label="Atalhos">${item('oferta', '/icons/icon-oferta.jpg', 'Oferta')}${item('pontos', '/icons/icon-pontos.jpg', 'Pontos')}${item('metas', '/icons/icon-metas.jpg', 'Metas')}${item('marketing', '/icons/icon-marketing.jpg', 'Marketing')}</div>`
-}
-
-function onIconbar(target: string): void {
-  if (target === 'oferta' || target === 'marketing') {
-    const banner = document.querySelector<HTMLElement>('#banner')
-    if (banner) {
-      const smooth = !window.matchMedia('(prefers-reduced-motion: reduce)').matches
-      banner.scrollIntoView({ behavior: smooth ? 'smooth' : 'auto', block: 'nearest' })
-    }
-    return
-  }
-  if (target === 'pontos') {
-    renderResults('Pontos estarão disponíveis na Área do Distribuidor — sem pontos fictícios por aqui.')
-    return
-  }
-  if (target === 'metas') {
-    renderResults('Metas estarão disponíveis na Área do Distribuidor.')
-  }
-}
-
-function resultsTemplate(message: string): string {
-  if (!state.session) return ''
-  const results = filteredClients()
-  const attended = state.clients.filter((client) => currentAction(state.session?.distributorId ?? '', client.id)).length
-  const pending = state.clients.length - attended
-  const cards = results.map(clientCard).join('')
-  return `${shortcutsTemplate(attended, pending)}<p class="result-count" role="status">${results.length === 1 ? '1 cliente' : `${results.length} clientes`} · dados deste dispositivo</p><p class="message">${escapeHtml(message || state.storageError || '')}</p><div class="client-list">${cards || '<p>Nenhum cliente encontrado para os filtros atuais.</p>'}</div>`
-}
-
-function avatarInitials(label: string): string {
-  return label.split(/\s+/).map((part) => part.slice(0, 1)).join('').slice(0, 2).toUpperCase()
-}
-
-function profileTemplate(): string {
-  const session = state.session
-  if (!session) return ''
-  return `<section><button class="back" data-nav="home" type="button">← Voltar</button><p class="eyebrow">Perfil</p><div class="profile-card"><span class="avatar avatar-lg" aria-hidden="true">${escapeHtml(avatarInitials(session.label))}</span><h1>${escapeHtml(session.label)}</h1><p>📍 ${escapeHtml(session.cityId)}</p></div><dl><div><dt>Distribuidor</dt><dd>${escapeHtml(session.distributorId)}</dd></div><div><dt>Cidade</dt><dd>${escapeHtml(session.cityId)}</dd></div><div><dt>Código</dt><dd>${escapeHtml(session.slug)}</dd></div></dl><p class="message">Contexto resolvido pela sessão no servidor.</p></section>`
-}
-
-function infoTemplate(route: 'precos' | 'contrato' | 'documentos' | 'ocorrencias'): string {
-  const copy = {
-    precos: { title: 'Preços', text: 'A tabela de preços do distribuidor será publicada aqui após a definição comercial. Nenhum valor é exibido antes da aprovação.' },
-    contrato: { title: 'Contrato', text: 'O contrato de distribuição ficará disponível aqui para consulta.' },
-    documentos: { title: 'Documentos', text: 'Documentos operacionais — tabelas, comunicados e materiais — ficarão disponíveis aqui.' },
-    ocorrencias: { title: 'Ocorrências', text: 'O canal para registrar ocorrências da operação — falta de produto, avaria, troca — ficará disponível aqui.' }
-  }[route]
-  return `<section><button class="back" data-nav="home" type="button">← Voltar</button><p class="eyebrow">${escapeHtml(copy.title)}</p><h1>${escapeHtml(copy.title)}</h1><p>${escapeHtml(copy.text)}</p></section>`
-}
-
-function newClientModalTemplate(): string {
-  const draft = state.newClient ?? emptyNewClient()
-  const errorFor = (field: 'name' | 'category' | 'address'): string =>
-    draft.errors.find((error) => error.field === field)?.message ?? ''
-  const field = (key: 'name' | 'category' | 'address' | 'phone', label: string, required: boolean): string => {
-    const message = key === 'phone' ? '' : errorFor(key)
-    return `<label>${label}${required ? ' *' : ''}<input id="new-client-${key}" name="${key}" value="${escapeHtml(draft[key])}" ${required ? 'required' : ''} autocomplete="off" ${message ? `aria-invalid="true" aria-describedby="err-new-client-${key}"` : ''} />${message ? `<p class="field-error" id="err-new-client-${key}">${escapeHtml(message)}</p>` : ''}</label>`
-  }
-  return `<div class="modal-backdrop" id="new-client-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="new-client-title"><h2 id="new-client-title">Cadastrar cliente</h2><p class="modal-sub">Salvo neste aparelho, visível só para o seu distribuidor.</p><form id="new-client-form" novalidate>${field('name', 'Nome', true)}${field('category', 'Categoria', true)}${field('address', 'Endereço', true)}${field('phone', 'Telefone', false)}${draft.saveError ? `<p class="field-error" role="alert">${escapeHtml(draft.saveError)}</p>` : ''}<div class="modal-actions"><button class="action" type="submit">Salvar</button><button class="text-button" id="new-client-cancel" type="button">Cancelar</button></div></form></div></div>`
-}
-
-function closeNewClient(): void {
-  if (!state.newClient) return
-  state.newClient = null
-  render()
-}
-
-function onSaveNewClient(event: SubmitEvent): void {
-  event.preventDefault()
-  if (!state.session) return
-  const form = event.currentTarget as HTMLFormElement
-  const fields = new FormData(form)
-  const draft = {
-    name: String(fields.get('name') ?? ''),
-    category: String(fields.get('category') ?? ''),
-    address: String(fields.get('address') ?? ''),
-    phone: String(fields.get('phone') ?? ''),
-    errors: [] as NewClientError[],
-    saveError: ''
-  }
-  draft.errors = validateNewClient(draft)
-  if (draft.errors.length > 0) {
-    state.newClient = draft
-    render()
-    document.querySelector<HTMLInputElement>('#new-client-name')?.focus()
-    return
-  }
-  const storage = browserStorage()
-  if (!storage) {
-    state.newClient = { ...draft, saveError: 'Armazenamento local indisponível. Nada foi salvo.' }
-    render()
-    return
-  }
-  try {
-    const created = createManualClient(draft, state.session.slug)
-    const manual = loadManualClients(storage, state.session.slug)
-    manual.push(created)
-    saveManualClients(storage, state.session.slug, manual)
-  } catch {
-    state.newClient = { ...draft, saveError: 'Não foi possível salvar. Nada foi criado.' }
-    render()
-    return
-  }
-  state.newClient = null
-  state.statusFilter = 'all'
-  refreshClients(state.catalog)
-  render('Cliente cadastrado neste aparelho.')
-}
-
-function detailTemplate(client: Client, message: string): string {
-  const actions = ATTENDANCE_ACTIONS.map((action) => `<button class="action" data-action="${escapeHtml(action)}" type="button" ${state.storageError ? 'disabled' : ''}>${escapeHtml(action)}</button>`).join('')
-  const latest = state.history[0]
-  const history = state.history.length
-    ? `<ol class="attendance-history">${state.history.map((record) => `<li><strong>${escapeHtml(record.action)}</strong><small>${escapeHtml(new Date(record.capturedAt).toLocaleString('pt-BR'))}</small></li>`).join('')}</ol>`
-    : '<p>Nenhum atendimento registrado neste dispositivo.</p>'
-  return `<section><button class="back" id="back" type="button">← Clientes</button><p class="eyebrow">Atendimento</p><h1>${escapeHtml(client.name)}</h1><p>${escapeHtml(client.category)}</p><dl><div><dt>Endereço</dt><dd>${escapeHtml(client.address ?? 'Não informado')}</dd></div><div><dt>Telefone</dt><dd>${escapeHtml(client.phone ?? 'Não informado')}</dd></div></dl><div class="actions"><h2>Registrar resultado</h2><p>${state.storageError ? escapeHtml(state.storageError) : 'O GPS será solicitado antes do registro.'}</p>${actions}</div><section class="history"><h2>Histórico neste dispositivo</h2>${latest ? `<p>Último: <strong>${escapeHtml(latest.action)}</strong></p>` : ''}${history}</section><p class="message" role="status">${escapeHtml(message)}</p></section>`
-}
-
-function bindClientCards(): void {
-  document.querySelectorAll<HTMLButtonElement>('[data-client-id]').forEach((button) => button.addEventListener('click', () => {
-    state.selectedClient = state.clients.find((client) => client.id === button.dataset.clientId) ?? null
-    void loadHistory()
-  }))
-}
-
-function bindViewEvents(): void {
-  bindClientCards()
-  document.querySelector<HTMLButtonElement>('#back')?.addEventListener('click', () => { state.selectedClient = null; render() })
-  document.querySelectorAll<HTMLButtonElement>('[data-action]').forEach((button) => button.addEventListener('click', () => void onAttendance(button.dataset.action ?? '')))
-}
-
-async function onLogin(event: SubmitEvent): Promise<void> {
-  event.preventDefault()
-  const form = event.currentTarget as HTMLFormElement
-  const fields = new FormData(form)
-  try {
-    const response = await login(String(fields.get('login') ?? ''), String(fields.get('password') ?? ''))
-    state.session = response.session
-    state.route = 'home'
-    state.statusFilter = 'all'
-    state.menuOpen = false
-    const catalog = await getClients()
-    refreshClients(catalog.clients)
-    state.storage = new AttendanceStorage()
-    try {
-      await state.storage.initialize()
-    } catch (error) {
-      state.storage = null
-      state.storageError = error instanceof Error ? `${error.message} O registro de atendimento está bloqueado.` : 'SQLite local indisponível. O registro de atendimento está bloqueado.'
-    }
-    render()
-  } catch (error) {
-    render(error instanceof Error ? error.message : 'Não foi possível entrar.')
-  }
-}
-
-async function onLogout(): Promise<void> {
-  await logout().catch(() => undefined)
-  state.session = null
-  state.clients = []
-  state.catalog = []
-  state.newClient = null
-  state.selectedClient = null
-  state.storage = null
-  state.storageError = null
-  state.history = []
-  state.menuOpen = false
-  state.route = 'home'
-  state.statusFilter = 'all'
-  render()
-}
-
-async function onAttendance(actionValue: string): Promise<void> {
-  if (!state.session || !state.selectedClient || !state.storage) return
-  try {
-    assertAttendanceAction(actionValue)
-    render('Capturando localização…')
-    const position = await capturePosition()
-    const record = createAttendanceRecord({
-      distributorId: state.session.distributorId,
-      clientId: state.selectedClient.id,
-      action: actionValue,
-      ...position
+function bindHeaderEvents() {
+  const logoutBtn = document.getElementById('btn-logout')
+  if (logoutBtn) {
+    logoutBtn.addEventListener('click', async () => {
+      hapticFeedback(40)
+      if (confirm('Deseja sair da sua conta neste aparelho?')) {
+        await executeLogout()
+        state.session = null
+        state.products = []
+        state.currentScreen = 'login'
+        render()
+      }
     })
-    const result = await state.storage.save(record)
-    await loadHistory(result.warning ?? 'Atendimento registrado no dispositivo.')
-  } catch (error) {
-    render(error instanceof Error ? error.message : 'Não foi possível registrar o atendimento.')
   }
 }
 
-async function bootstrap(): Promise<void> {
-  if ('serviceWorker' in navigator) {
-    if (import.meta.env.PROD) {
-      void navigator.serviceWorker.register('/service-worker.js')
+// ==========================
+// TELA DE LOGIN COM PIN DO DISTRIBUIDOR
+// ==========================
+function renderLoginScreen() {
+  const f = state.loginForm
+  appRoot.innerHTML = `
+    <div class="screen-container" style="justify-content:center;max-width:440px;margin:auto;padding-top:32px">
+      <h1>TREALI</h1><h2>Entrar no modo rua</h2>
+      <p>Use o WhatsApp e o PIN fornecidos pela fábrica.</p>
+      ${f.error ? `<p role="alert" style="color:#b91c1c">${f.error}</p>` : ''}
+      <label for="login-phone">WhatsApp com DDD</label>
+      <input id="login-phone" type="tel" class="input-huge" inputmode="tel" autocomplete="tel" value="${f.phone.replace(/[^0-9]/g, '')}">
+      <label for="login-pin">PIN</label>
+      <input id="login-pin" type="password" class="input-huge" inputmode="numeric" maxlength="12" autocomplete="current-password">
+      <button id="btn-submit-pin" class="btn-huge btn-primary" ${f.isLoading ? 'disabled' : ''}>${f.isLoading ? 'Verificando...' : 'Entrar'}</button>
+    </div>`
+  const phoneInput = document.getElementById('login-phone') as HTMLInputElement
+  const pinInput = document.getElementById('login-pin') as HTMLInputElement
+  phoneInput.addEventListener('input', () => { f.phone = phoneInput.value })
+  pinInput.addEventListener('input', () => { f.pin = pinInput.value })
+  document.getElementById('btn-submit-pin')?.addEventListener('click', async () => {
+    f.isLoading = true; f.error = ''; render()
+    const result = await loginWithPin(f.phone, f.pin)
+    f.isLoading = false
+    if (!result.success || !result.session) { f.error = result.message || 'Não foi possível entrar.'; f.pin = ''; render(); return }
+    state.session = result.session
+    localStorage.setItem('treali_last_phone', result.session.phone)
+    try { await pullRemoteCatalog(); await refreshData() } catch { /* cache verificado está disponível offline */ }
+    state.currentScreen = 'home'
+    render()
+    void syncPendingData()
+  })
+}
+
+// ==========================
+// TELA 1: MINHA ROTA & CLIENTES (HOME)
+// ==========================
+function getFilteredClients(): ClientPDV[] {
+  const query = state.clientSearchQuery.trim().toLowerCase()
+  let list = state.clients
+
+  if (query) {
+    list = list.filter((c) => {
+      return (
+        c.name.toLowerCase().includes(query) ||
+        (c.contactName && c.contactName.toLowerCase().includes(query)) ||
+        (c.neighborhood && c.neighborhood.toLowerCase().includes(query)) ||
+        (c.city && c.city.toLowerCase().includes(query))
+      )
+    })
+  }
+
+  // Ordenação inteligente da rota:
+  // 1. Clientes em "REPOR URGENTE" (>14 dias sem comprar) no topo
+  // 2. Clientes com "RECOMPRA PRÓXIMA" (7-14 dias)
+  // 3. "NOVO PROSPECT" (sem pedidos anteriores)
+  // 4. "ABASTECIDO" (<7 dias)
+  // 5. Clientes já atendidos no dia vão para o final
+  return [...list].sort((a, b) => {
+    const isDoneA = !!state.todayClientOrders.get(a.id)
+    const isDoneB = !!state.todayClientOrders.get(b.id)
+    const repA = calculateRepurchaseStatus(a.lastOrderDate, isDoneA)
+    const repB = calculateRepurchaseStatus(b.lastOrderDate, isDoneB)
+
+    if (repA.priority !== repB.priority) {
+      return repA.priority - repB.priority
+    }
+
+    // Se ambos tiverem mesma prioridade (ex: URGENTE), quem tem mais dias sem comprar vem primeiro
+    if (repA.daysAgo !== null && repB.daysAgo !== null && repA.daysAgo !== repB.daysAgo) {
+      return repB.daysAgo - repA.daysAgo
+    }
+
+    return a.name.localeCompare(b.name)
+  })
+}
+
+function renderClientCardsHTML(clients: ClientPDV[]): string {
+  if (clients.length === 0) {
+    return `
+      <div style="text-align:center; background:var(--bg-card); border:2px dashed var(--border-strong); border-radius:var(--radius-lg); padding:32px 16px; color:var(--text-muted); font-weight:700;">
+        <div style="font-size:32px; margin-bottom:8px;">📍</div>
+        Nenhum cliente encontrado na rota com este filtro.
+      </div>
+    `
+  }
+
+  return clients.map((cli) => {
+    const todayOrder = state.todayClientOrders.get(cli.id)
+    const isDone = !!todayOrder
+
+    // Termômetro de Recompra
+    const repurchase = calculateRepurchaseStatus(cli.lastOrderDate, isDone)
+    const isUrgent = repurchase.status === 'URGENT' && !isDone
+    const urgentCardClass = isUrgent ? 'urgent-border' : ''
+
+    const badgeHTML = isDone
+      ? `<span class="client-badge done">${icons.check} ATENDIDO (${todayOrder.totalPackages} pct)</span>`
+      : `<span class="client-badge pending">${icons.route} FALTA VISITAR</span>`
+
+    const repurchaseBadgeHTML = `
+      <div class="repurchase-badge ${repurchase.badgeClass}">
+        ${repurchase.status === 'URGENT' ? '🚨' : repurchase.status === 'SOON' ? '⚠️' : repurchase.status === 'STOCKED' ? '✅' : '🆕'}
+        <span>${repurchase.label}</span>
+      </div>
+    `
+
+    const orderBtnText = isDone
+      ? `${icons.check} + Repetir / Novo Pedido`
+      : `${icons.cart} + Lançar Pedido`
+
+    const orderBtnClass = isDone ? 'btn-card-order repeat' : 'btn-card-order'
+
+    return `
+      <div class="client-card ${isDone ? 'done' : ''} ${urgentCardClass}">
+        <div class="client-header" data-client-id="${cli.id}">
+          <div>
+            <div class="client-name">${cli.name}</div>
+            <div class="client-meta">
+              <span>${icons.user} ${cli.contactName || 'Responsável'}</span>
+              <span>•</span>
+              <span>${cli.neighborhood ? `${cli.neighborhood}, ` : ''}${cli.city}</span>
+            </div>
+            ${repurchaseBadgeHTML}
+          </div>
+          ${badgeHTML}
+        </div>
+        <div class="client-actions">
+          <button class="btn-action-small whatsapp" data-action="whatsapp" data-phone="${cli.whatsapp}" data-name="${cli.contactName || cli.name}">
+            ${icons.whatsapp} WhatsApp
+          </button>
+          <button class="btn-action-small route" data-action="route" data-name="${cli.name}" data-city="${cli.city}" data-addr="${cli.address || ''}" data-lat="${cli.latitude || ''}" data-lng="${cli.longitude || ''}">
+            ${icons.route} Como Chegar
+          </button>
+        </div>
+        <button class="${orderBtnClass}" data-action="create-order" data-client-id="${cli.id}">
+          ${orderBtnText}
+        </button>
+      </div>
+    `
+  }).join('')
+}
+
+function bindRouteListEvents() {
+  document.querySelectorAll('[data-action="create-order"]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      const clientId = (e.currentTarget as HTMLElement).getAttribute('data-client-id')
+      if (clientId) {
+        hapticFeedback(40)
+        resetOrderDraft()
+        state.orderDraft.mode = 'existing'
+        state.orderDraft.selectedClientId = clientId
+        state.currentScreen = 'order'
+        render()
+      }
+    })
+  })
+
+  document.querySelectorAll('[data-action="whatsapp"]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      hapticFeedback(30)
+      const phone = (e.currentTarget as HTMLElement).getAttribute('data-phone')
+      const name = (e.currentTarget as HTMLElement).getAttribute('data-name')
+      if (phone) {
+        openWhatsApp(phone, `Olá ${name || ''}, estou a caminho com as maioneses Treali!`)
+      }
+    })
+  })
+
+  document.querySelectorAll('[data-action="route"]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      hapticFeedback(30)
+      const el = e.currentTarget as HTMLElement
+      const name = el.getAttribute('data-name') || ''
+      const city = el.getAttribute('data-city') || ''
+      const addr = el.getAttribute('data-addr') || ''
+      const lat = el.getAttribute('data-lat') ? Number(el.getAttribute('data-lat')) : undefined
+      const lng = el.getAttribute('data-lng') ? Number(el.getAttribute('data-lng')) : undefined
+      openNavigationRoute(name, city, addr, lat, lng)
+    })
+  })
+}
+
+function unavailablePriceNoticeHTML(): string {
+  if (!state.unavailablePrices.length) return ''
+  return `<section role="alert" style="padding:14px;margin:12px 0;border:2px solid #b91c1c;border-radius:10px;background:#fff1f2">
+    <strong>Edição de preço sem sincronização</strong><p>A fábrica desabilitou estes produtos. A edição local não será enviada:</p>
+    ${state.unavailablePrices.map((item) => `<div>${item.name} <button type="button" data-discard-price="${item.productId}">Descartar edição local</button></div>`).join('')}
+  </section>`
+}
+function bindUnavailablePriceEvents(): void {
+  document.querySelectorAll<HTMLButtonElement>('[data-discard-price]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      if (!state.session?.distributorId) return
+      await discardUnavailablePrice(button.dataset.discardPrice || '')
+      await refreshData()
+      render()
+    })
+  })
+}
+
+function renderHomeScreen() {
+  const summary = state.dailySummary
+  const formattedRevenue = summary.totalAmount.toLocaleString('pt-BR', {
+    style: 'currency',
+    currency: 'BRL'
+  })
+
+  const filteredClients = getFilteredClients()
+  const clientsHTML = renderClientCardsHTML(filteredClients)
+
+  const formattedPhone = state.session?.phone
+    ? state.session.phone.replace(/(\d{2})(\d{5})(\d{4})/, '($1) $2-$3')
+    : ''
+
+  appRoot.innerHTML = `
+    ${createHeaderHTML()}
+    <div class="screen-container">
+      ${unavailablePriceNoticeHTML()}
+      <!-- IDENTIFICAÇÃO DO DISTRIBUIDOR CONECTADO -->
+      <div class="distributor-bar">
+        <div class="distributor-bar-left">
+          <div class="distributor-bar-avatar">🛵</div>
+          <div class="distributor-bar-text">
+            <span class="distributor-bar-label">Distribuidor Ativo</span>
+            <span class="distributor-bar-name">${state.session?.name || 'Distribuidor Treali'}</span>
+          </div>
+        </div>
+        ${formattedPhone ? `<span class="distributor-bar-phone">${formattedPhone}</span>` : ''}
+      </div>
+
+      <!-- BOTÃO HERO GIGANTE NO TOPO -->
+      <button id="btn-top-new-order" class="btn-huge btn-primary" style="height:64px; font-size:21px;">
+        ${icons.cart} + NOVO PEDIDO
+      </button>
+
+      <!-- PLACAR DO DIA / FATURAMENTO IMPONENTE -->
+      <div class="daily-scorecard">
+        <div class="score-item">
+          <span class="score-label">Faturado Hoje</span>
+          <span class="score-value green">${formattedRevenue}</span>
+        </div>
+        <div class="score-item bordered">
+          <span class="score-label">Entregues</span>
+          <span class="score-value">${summary.totalPackages} <span class="score-unit">pct</span></span>
+        </div>
+        <div class="score-item">
+          <span class="score-label">Pedidos</span>
+          <span class="score-value">${summary.totalOrders}</span>
+        </div>
+      </div>
+
+      <!-- Resumo de vendas; margem depende do custo individual. -->
+      <div class="profit-banner-card">
+        <div class="profit-header">
+          <div class="profit-label">
+            <span>💰</span>
+            <span>Vendas do dia</span>
+          </div>
+        </div>
+        <div class="profit-value-highlight">${formattedRevenue}</div>
+      </div>
+
+      <!-- BARRA DE BUSCA RÁPIDA -->
+      <div class="search-wrapper">
+        <span class="search-icon">${icons.search}</span>
+        <input id="search-client" class="search-input" placeholder="Buscar cliente ou bairro na rota..." value="${state.clientSearchQuery}" />
+      </div>
+
+      <!-- LISTA DA ROTA -->
+      <div class="section-title">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span>📍 Clientes da Minha Rota</span>
+          <span class="badge-count">${state.clients.length}</span>
+        </div>
+        <button id="btn-add-client-quick" style="background:var(--bg-card); border:2px solid var(--border-strong); color:var(--text-body); font-size:13px; font-weight:800; padding:6px 12px; border-radius:var(--radius-sm); cursor:pointer;">
+          + Novo PDV
+        </button>
+      </div>
+
+      <div id="route-list-container" class="route-list">
+        ${clientsHTML}
+      </div>
+    </div>
+  `
+
+  bindHeaderEvents()
+  bindUnavailablePriceEvents()
+  bindRouteListEvents()
+
+  // Busca instantânea de clientes
+  const searchInput = document.getElementById('search-client') as HTMLInputElement | null
+  searchInput?.addEventListener('input', () => {
+    state.clientSearchQuery = searchInput.value
+    const listContainer = document.getElementById('route-list-container')
+    if (listContainer) {
+      listContainer.innerHTML = renderClientCardsHTML(getFilteredClients())
+      bindRouteListEvents()
+    }
+  })
+
+  // Botão gigante Novo Pedido
+  document.getElementById('btn-top-new-order')?.addEventListener('click', () => {
+    hapticFeedback(40)
+    resetOrderDraft()
+    state.currentScreen = 'order'
+    render()
+  })
+
+  // Botão Novo PDV
+  document.getElementById('btn-add-client-quick')?.addEventListener('click', () => {
+    hapticFeedback(40)
+    resetOrderDraft()
+    state.orderDraft.mode = 'new'
+    state.currentScreen = 'order'
+    render()
+  })
+}
+
+// ==========================
+// TELA 2: REGISTRO DE PEDIDO / NOVO PDV
+// ==========================
+function resetOrderDraft() {
+  const initialQuantities: Record<string, number> = {}
+  for (const prod of state.products) {
+    initialQuantities[prod.id] = 0
+  }
+
+  state.orderDraft = {
+    mode: state.clients.length > 0 ? 'existing' : 'new',
+    selectedClientId: state.clients.length > 0 ? state.clients[0].id : '',
+    newClient: {
+      name: '',
+      contactName: '',
+      whatsapp: '',
+      city: 'Muriaé',
+      neighborhood: '',
+      latitude: undefined,
+      longitude: undefined
+    },
+    newClientWhatsappError: '',
+    quantities: initialQuantities,
+    paymentMethod: 'PIX_A_VISTA',
+    nextDelivery: 'Terça-feira',
+    isGpsLoading: false
+  }
+}
+
+function calculateOrderTotal(): { totalPackages: number; totalAmount: number } {
+  let totalPackages = 0
+  let totalAmount = 0
+
+  for (const flavor of state.products) {
+    const qty = state.orderDraft.quantities[flavor.id] || 0
+    totalPackages += qty
+    if (Number.isFinite(flavor.unitPrice)) totalAmount += qty * flavor.unitPrice
+  }
+
+  return { totalPackages, totalAmount }
+}
+
+function renderOrderScreen() {
+  const d = state.orderDraft
+  const { totalPackages, totalAmount } = calculateOrderTotal()
+  const formattedTotal = totalAmount.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })
+
+  const clientOptionsHTML = state.clients.map((c) => {
+    const selected = c.id === d.selectedClientId ? 'selected' : ''
+    return `<option value="${c.id}" ${selected}>${c.name} (${c.neighborhood || c.city})</option>`
+  }).join('')
+
+  const flavorsHTML = state.products.map((f) => {
+    const qty = d.quantities[f.id] || 0
+    const hasQty = qty > 0
+    const hasPrice = Number.isFinite(f.unitPrice)
+    const subtotal = hasPrice ? qty * f.unitPrice : 0
+
+    return `
+      <div class="flavor-row ${hasQty ? 'has-qty' : ''}">
+        <div class="flavor-info">
+          <div class="flavor-name">${f.name}</div>
+          <div class="flavor-price">${hasPrice ? `R$ ${f.unitPrice.toFixed(2)} / pacote` : 'Defina seu preço de revenda para vender'}</div>
+          <label class="flavor-price">Seu preço (R$) <input data-resale-price="${f.id}" type="number" min="0" step="0.01" value="${hasPrice ? f.unitPrice.toFixed(2) : ''}" style="width:100px" /></label>
+          ${state.conflictPriceIds.has(f.id) ? `<small role="alert">Preço em conflito. No servidor: ${state.remoteConflictPrices.get(f.id)?.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) ?? 'não definido'}. Confira o valor e confirme para reenviar.</small><button type="button" data-retry-price="${f.id}">Confirmar meu preço</button>` : state.pendingPriceIds.has(f.id) ? '<small>Sincronização do preço pendente</small>' : ''}
+          ${hasQty ? `<div class="flavor-subtotal">${icons.check} ${qty} pct = R$ ${subtotal.toFixed(2)}</div>` : ''}
+        </div>
+        <div class="flavor-stepper">
+          <button class="btn-step sub" data-step-sub="${f.id}" ${qty === 0 ? 'disabled' : ''} aria-label="Diminuir ${f.name}">
+            ${icons.minus}
+          </button>
+          <span class="step-count">${qty}</span>
+          <button class="btn-step add" data-step-add="${f.id}" ${hasPrice ? '' : 'disabled'} aria-label="Aumentar ${f.name}">
+            ${icons.plus}
+          </button>
+        </div>
+      </div>
+    `
+  }).join('')
+
+  appRoot.innerHTML = `
+    ${createHeaderHTML()}
+    <div class="screen-container">
+      ${unavailablePriceNoticeHTML()}
+      <!-- CABEÇALHO DO FECHAMENTO COM VOLTAR -->
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <button id="btn-cancel-order" class="btn-action-small" style="background:var(--bg-card); border:2px solid var(--border-strong); color:var(--text-body); font-size:15px; width:120px;">
+          ${icons.arrowLeft} Voltar
+        </button>
+        <span style="font-size:18px; font-weight:900; color:var(--treali-yellow-dark);">LANÇAR PEDIDO</span>
+      </div>
+
+      <!-- SELETOR CLIENTE EXISTENTE OU NOVO -->
+      <div class="client-tabs-wrapper">
+        <button id="tab-client-existing" class="client-tab-btn ${d.mode === 'existing' ? 'active' : ''}">
+          <span>👥</span> Cliente da Rota
+        </button>
+        <button id="tab-client-new" class="client-tab-btn ${d.mode === 'new' ? 'active' : ''}">
+          <span>➕</span> Novo PDV
+        </button>
+      </div>
+
+      ${
+        d.mode === 'existing'
+          ? `
+        <div class="input-group">
+          <label class="input-label">Selecione o Estabelecimento</label>
+          <select id="select-existing-client" class="input-huge" style="cursor:pointer;">
+            ${clientOptionsHTML}
+          </select>
+        </div>
+      `
+          : `
+        <div class="pdv-form-card">
+          <div class="pdv-form-header">
+            <span class="pdv-form-title">
+              <span>📍</span> Cadastrar Novo PDV na Rota
+            </span>
+            <span class="pdv-form-badge">Modo Rua</span>
+          </div>
+
+          <div class="input-group">
+            <label class="input-label">
+              <span>Nome do Estabelecimento *</span>
+            </label>
+            <input id="input-new-name" type="text" class="input-huge" placeholder="Ex: Hamburgueria do Zé" value="${d.newClient.name}" autocomplete="organization" />
+          </div>
+
+          <div class="pdv-grid-row">
+            <div class="input-group">
+              <label class="input-label">
+                <span>Responsável</span>
+              </label>
+              <input id="input-new-contact" type="text" class="input-huge" placeholder="Ex: Zé (Proprietário)" value="${d.newClient.contactName}" autocomplete="name" />
+            </div>
+            <div class="input-group">
+              <label class="input-label">
+                <span>WhatsApp *</span>
+              </label>
+              <input id="input-new-whatsapp" type="tel" class="input-huge ${d.newClientWhatsappError ? 'has-error' : ''}" placeholder="(32) 99999-8888" value="${formatBrazilianPhone(d.newClient.whatsapp)}" inputmode="tel" autocomplete="tel" />
+              ${d.newClientWhatsappError ? `<div id="new-whatsapp-error-live" class="input-error-msg">⚠️ ${d.newClientWhatsappError}</div>` : ''}
+            </div>
+          </div>
+
+          <div class="pdv-grid-row">
+            <div class="input-group">
+              <label class="input-label">
+                <span>Bairro</span>
+              </label>
+              <input id="input-new-neighborhood" type="text" class="input-huge" placeholder="Ex: Centro" value="${d.newClient.neighborhood}" />
+            </div>
+            <div class="input-group">
+              <label class="input-label">
+                <span>Cidade</span>
+              </label>
+              <input id="input-new-city" type="text" class="input-huge" placeholder="Ex: Muriaé" value="${d.newClient.city}" />
+            </div>
+          </div>
+
+          <!-- BOTÃO GPS DINÂMICO E RESPONSIVO -->
+          <button id="btn-use-gps" type="button" class="btn-gps-responsive ${d.newClient.latitude ? 'gps-captured' : ''}">
+            ${
+              d.isGpsLoading
+                ? `<span>${icons.refresh} Obtendo sinal GPS do satélite...</span>`
+                : d.newClient.latitude
+                ? `<span>${icons.check} Localização GPS Gravada</span><span class="gps-coords-badge">Lat: ${d.newClient.latitude.toFixed(4)} • Lng: ${d.newClient.longitude?.toFixed(4)}</span>`
+                : `<span>${icons.gps} Usar Minha Localização Atual (GPS)</span><span class="gps-coords-badge">Grava coordenadas para roteirização</span>`
+            }
+          </button>
+
+          <!-- BOTÃO SALVAR APENAS O PDV NA ROTA -->
+          <button id="btn-save-pdv-only" type="button" class="pdv-quick-save-btn">
+            💾 Salvar Apenas o PDV na Rota
+          </button>
+        </div>
+      `
+      }
+
+      <!-- GRADE DE SABORES COM STEPPER GIGANTE -->
+      <div class="section-title">
+        <span>Sabores Treali (Quantidade de Pacotes)</span>
+        <span class="badge-count">${totalPackages} pct</span>
+      </div>
+
+      <div class="flavors-grid">
+        ${flavorsHTML}
+      </div>
+
+      <!-- FORMA DE PAGAMENTO -->
+      <div class="section-title">
+        <span>Forma de Pagamento</span>
+      </div>
+
+      <div class="payment-selector">
+        <button class="payment-pill ${d.paymentMethod === 'PIX_A_VISTA' ? 'active' : ''}" data-pay="PIX_A_VISTA">
+          ${icons.money} À Vista / Pix
+        </button>
+        <button class="payment-pill ${d.paymentMethod === 'FATURADO_BOLETO' ? 'active' : ''}" data-pay="FATURADO_BOLETO">
+          ${icons.invoice} Faturado / Boleto
+        </button>
+      </div>
+
+      <!-- PREVISÃO DE ENTREGA -->
+      <div class="section-title">
+        <span>Próxima Entrega</span>
+      </div>
+
+      <div class="delivery-selector">
+        <button class="delivery-pill ${d.nextDelivery === 'Terça-feira' ? 'active' : ''}" data-delivery="Terça-feira">
+          Terça-feira
+        </button>
+        <button class="delivery-pill ${d.nextDelivery === 'Quinta-feira' ? 'active' : ''}" data-delivery="Quinta-feira">
+          Quinta-feira
+        </button>
+        <button class="delivery-pill ${d.nextDelivery === 'Amanhã' ? 'active' : ''}" data-delivery="Amanhã">
+          Amanhã
+        </button>
+      </div>
+
+      <!-- TOTAL E BOTÃO FINALIZAR -->
+      <div class="total-bar">
+        <div>
+          <div class="total-bar-label">Total do Pedido</div>
+          <div class="total-bar-sub">${totalPackages} pacotes selecionados</div>
+        </div>
+        <div class="total-bar-value">${formattedTotal}</div>
+      </div>
+
+      <button id="btn-finish-order" class="btn-huge btn-success" style="height:66px; font-size:20px;">
+        ${icons.check} FINALIZAR PEDIDO (${formattedTotal})
+      </button>
+    </div>
+  `
+
+  bindHeaderEvents()
+  bindUnavailablePriceEvents()
+
+  document.querySelectorAll<HTMLButtonElement>('[data-retry-price]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      if (!state.session?.distributorId) return
+      const row = (await getDistributorProductPrices(state.session.distributorId)).find((item) => item.productId === button.dataset.retryPrice)
+      if (!row?.conflict) return
+      await saveDistributorProductPrice({ ...row, conflict: false, resalePendingSync: true,
+        mutationId: crypto.randomUUID(), updatedAt: new Date().toISOString() })
+      await refreshData()
+      render()
+      void syncPendingData()
+    })
+  })
+
+  document.querySelectorAll<HTMLInputElement>('[data-resale-price]').forEach((input) => {
+    input.addEventListener('change', async () => {
+      const productId = input.dataset.resalePrice!
+      if (!state.session?.distributorId) return
+      const row = (await getDistributorProductPrices(state.session.distributorId)).find((item) => item.productId === productId)
+      const resalePrice = Number(input.value)
+      if (!row || input.value.trim() === '' || !Number.isFinite(resalePrice) || resalePrice <= 0 || Math.round(resalePrice * 100) !== resalePrice * 100) {
+        alert('Informe um preço de revenda válido em reais e centavos.')
+        return
+      }
+      try {
+        await saveDistributorProductPrice({ ...row, resalePrice, resalePendingSync: true, conflict: false, mutationId: crypto.randomUUID(), updatedAt: new Date().toISOString() })
+        await refreshData()
+        showToast('Preço salvo neste aparelho; sincronização pendente.')
+        render()
+        void syncPendingData()
+      } catch {
+        alert('Não foi possível salvar o preço de revenda.')
+      }
+    })
+  })
+
+  // Voltar para Home
+  document.getElementById('btn-cancel-order')?.addEventListener('click', () => {
+    hapticFeedback(30)
+    state.currentScreen = 'home'
+    render()
+  })
+
+  // Alternar abas cliente
+  document.getElementById('tab-client-existing')?.addEventListener('click', () => {
+    hapticFeedback(25)
+    d.mode = 'existing'
+    render()
+  })
+
+  document.getElementById('tab-client-new')?.addEventListener('click', () => {
+    hapticFeedback(25)
+    d.mode = 'new'
+    render()
+  })
+
+  // Seleção de cliente existente
+  const selectClient = document.getElementById('select-existing-client') as HTMLSelectElement | null
+  selectClient?.addEventListener('change', () => {
+    d.selectedClientId = selectClient.value
+  })
+
+  // Captura dos inputs do cliente novo
+  const inputName = document.getElementById('input-new-name') as HTMLInputElement | null
+  const inputContact = document.getElementById('input-new-contact') as HTMLInputElement | null
+  const inputWhatsapp = document.getElementById('input-new-whatsapp') as HTMLInputElement | null
+  const inputNeighborhood = document.getElementById('input-new-neighborhood') as HTMLInputElement | null
+  const inputCity = document.getElementById('input-new-city') as HTMLInputElement | null
+
+  inputName?.addEventListener('input', () => { d.newClient.name = inputName.value })
+  inputContact?.addEventListener('input', () => { d.newClient.contactName = inputContact.value })
+
+  inputWhatsapp?.addEventListener('input', () => {
+    const raw = inputWhatsapp.value
+    const masked = formatBrazilianPhone(raw)
+    inputWhatsapp.value = masked
+    d.newClient.whatsapp = masked
+
+    const digitsOnly = masked.replace(/\D/g, '')
+    if (digitsOnly.length >= 10) {
+      if (!validateBrazilianMobilePhone(masked)) {
+        d.newClientWhatsappError = 'Informe um celular/WhatsApp válido com DDD'
+        inputWhatsapp.classList.add('has-error')
+        let errEl = document.getElementById('new-whatsapp-error-live')
+        if (!errEl) {
+          errEl = document.createElement('div')
+          errEl.id = 'new-whatsapp-error-live'
+          errEl.className = 'input-error-msg'
+          inputWhatsapp.parentElement?.appendChild(errEl)
+        }
+        errEl.innerHTML = '⚠️ Informe um celular/WhatsApp válido com DDD'
+      } else {
+        d.newClientWhatsappError = ''
+        inputWhatsapp.classList.remove('has-error')
+        document.getElementById('new-whatsapp-error-live')?.remove()
+      }
+    } else if (d.newClientWhatsappError) {
+      d.newClientWhatsappError = ''
+      inputWhatsapp.classList.remove('has-error')
+      document.getElementById('new-whatsapp-error-live')?.remove()
+    }
+  })
+
+  inputNeighborhood?.addEventListener('input', () => { d.newClient.neighborhood = inputNeighborhood.value })
+  inputCity?.addEventListener('input', () => { d.newClient.city = inputCity.value })
+
+  // Botão GPS
+  document.getElementById('btn-use-gps')?.addEventListener('click', async () => {
+    d.isGpsLoading = true
+    render()
+
+    const pos = await captureCurrentPosition()
+    d.isGpsLoading = false
+
+    if (pos) {
+      d.newClient.latitude = pos.latitude
+      d.newClient.longitude = pos.longitude
+      hapticFeedback(60)
+      showToast('Coordenadas GPS capturadas com sucesso!')
+
+      // Geocodificação reversa para autocompletar cidade/bairro
+      const rev = await tryReverseGeocode(pos.latitude, pos.longitude)
+      if (rev) {
+        if (rev.city && !d.newClient.city) d.newClient.city = rev.city
+        if (rev.neighborhood && !d.newClient.neighborhood) d.newClient.neighborhood = rev.neighborhood
+      }
     } else {
-      void navigator.serviceWorker.getRegistrations().then((registrations) => Promise.all(registrations.map((registration) => registration.unregister())))
+      showToast('Não foi possível obter GPS. Prossiga normalmente.')
     }
-  }
-  try {
-    const response = await getSession()
-    state.session = response.session
-    state.clients = (await getClients()).clients
-    refreshClients(state.clients)
-    state.storage = new AttendanceStorage()
+    render()
+  })
+
+  // Salvar apenas o PDV na rota (sem criar pedido imediatamente)
+  document.getElementById('btn-save-pdv-only')?.addEventListener('click', async () => {
+    if (!d.newClient.name.trim()) {
+      alert('Digite o nome do estabelecimento.')
+      return
+    }
+
+    if (!validateBrazilianMobilePhone(d.newClient.whatsapp)) {
+      d.newClientWhatsappError = 'Informe um celular/WhatsApp válido com DDD'
+      hapticFeedback(80)
+      alert('Informe um celular/WhatsApp válido com DDD')
+      inputWhatsapp?.focus()
+      inputWhatsapp?.classList.add('has-error')
+      let errEl = document.getElementById('new-whatsapp-error-live')
+      if (!errEl && inputWhatsapp) {
+        errEl = document.createElement('div')
+        errEl.id = 'new-whatsapp-error-live'
+        errEl.className = 'input-error-msg'
+        inputWhatsapp.parentElement?.appendChild(errEl)
+      }
+      if (errEl) errEl.innerHTML = '⚠️ Informe um celular/WhatsApp válido com DDD'
+      return
+    }
+
+    const newCli: ClientPDV = {
+      distributorId: state.session!.distributorId,
+      id: `cli_${Date.now()}`,
+      name: d.newClient.name.trim(),
+      contactName: d.newClient.contactName.trim() || d.newClient.name.trim(),
+      whatsapp: d.newClient.whatsapp.replace(/\D/g, ''),
+      city: d.newClient.city.trim() || 'Muriaé',
+      neighborhood: d.newClient.neighborhood.trim(),
+      latitude: d.newClient.latitude,
+      longitude: d.newClient.longitude,
+      createdAt: new Date().toISOString(),
+      isSynced: false
+    }
+
+    await saveClient(newCli)
+    state.clients.unshift(newCli)
+    hapticFeedback(60)
+    showToast(`✓ PDV "${newCli.name}" cadastrado na rota!`)
+
+    // Seleciona o cliente recém-cadastrado para se quiser lançar pedido em seguida
+    d.selectedClientId = newCli.id
+    d.mode = 'existing'
+    d.newClient = {
+      name: '',
+      contactName: '',
+      whatsapp: '',
+      city: 'Muriaé',
+      neighborhood: '',
+      latitude: undefined,
+      longitude: undefined
+    }
+
+    render()
+  })
+
+  // Botões de Stepper +/- para os Sabores
+  document.querySelectorAll('[data-step-add]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      const flavorId = (e.currentTarget as HTMLElement).getAttribute('data-step-add') as FlavorId
+      if (flavorId) {
+        hapticFeedback(25)
+        d.quantities[flavorId] = (d.quantities[flavorId] || 0) + 1
+        render()
+      }
+    })
+  })
+
+  document.querySelectorAll('[data-step-sub]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      const flavorId = (e.currentTarget as HTMLElement).getAttribute('data-step-sub') as FlavorId
+      if (flavorId) {
+        hapticFeedback(25)
+        if ((d.quantities[flavorId] || 0) > 0) {
+          d.quantities[flavorId]--
+          render()
+        }
+      }
+    })
+  })
+
+  // Forma de Pagamento
+  document.querySelectorAll('[data-pay]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      const pay = (e.currentTarget as HTMLElement).getAttribute('data-pay') as PaymentMethod
+      if (pay) {
+        hapticFeedback(25)
+        d.paymentMethod = pay
+        render()
+      }
+    })
+  })
+
+  // Previsão de Entrega
+  document.querySelectorAll('[data-delivery]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      const del = (e.currentTarget as HTMLElement).getAttribute('data-delivery')
+      if (del) {
+        hapticFeedback(25)
+        d.nextDelivery = del
+        render()
+      }
+    })
+  })
+
+  // FINALIZAR PEDIDO
+  document.getElementById('btn-finish-order')?.addEventListener('click', async () => {
+    if (totalPackages === 0) {
+      alert('Selecione pelo menos 1 pacote de maionese Treali.')
+      return
+    }
+
+    let clientToUse: ClientPDV | undefined
+
+    if (d.mode === 'existing') {
+      clientToUse = state.clients.find((c) => c.id === d.selectedClientId)
+      if (!clientToUse && state.clients.length > 0) {
+        clientToUse = state.clients[0]
+      }
+    } else {
+      // Validação de cliente novo
+      if (!d.newClient.name.trim()) {
+        alert('Digite o nome do estabelecimento.')
+        return
+      }
+
+      if (!validateBrazilianMobilePhone(d.newClient.whatsapp)) {
+        d.newClientWhatsappError = 'Informe um celular/WhatsApp válido com DDD'
+        hapticFeedback(80)
+        alert('Informe um celular/WhatsApp válido com DDD')
+        const inputWhatsapp = document.getElementById('input-new-whatsapp') as HTMLInputElement | null
+        inputWhatsapp?.focus()
+        inputWhatsapp?.classList.add('has-error')
+        let errEl = document.getElementById('new-whatsapp-error-live')
+        if (!errEl && inputWhatsapp) {
+          errEl = document.createElement('div')
+          errEl.id = 'new-whatsapp-error-live'
+          errEl.className = 'input-error-msg'
+          inputWhatsapp.parentElement?.appendChild(errEl)
+        }
+        if (errEl) errEl.innerHTML = '⚠️ Informe um celular/WhatsApp válido com DDD'
+        return
+      }
+
+      // Salva novo cliente no banco
+      const newCli: ClientPDV = {
+        distributorId: state.session!.distributorId,
+        id: `cli_${Date.now()}`,
+        name: d.newClient.name.trim(),
+        contactName: d.newClient.contactName.trim() || d.newClient.name.trim(),
+        whatsapp: d.newClient.whatsapp.replace(/\D/g, ''),
+        city: d.newClient.city.trim() || 'Muriaé',
+        neighborhood: d.newClient.neighborhood.trim(),
+        latitude: d.newClient.latitude,
+        longitude: d.newClient.longitude,
+        createdAt: new Date().toISOString(),
+        isSynced: false
+      }
+
+      await saveClient(newCli)
+      state.clients.unshift(newCli)
+      clientToUse = newCli
+    }
+
+    if (!clientToUse) {
+      alert('Erro ao selecionar cliente.')
+      return
+    }
+
+    // Congela preços vigentes por item no momento da finalização.
+    let items
     try {
-      await state.storage.initialize()
+      items = buildOrderItems(state.products, d.quantities)
     } catch (error) {
-      state.storage = null
-      state.storageError = error instanceof Error ? `${error.message} O registro de atendimento está bloqueado.` : 'SQLite local indisponível. O registro de atendimento está bloqueado.'
+      alert((error as Error).message)
+      return
     }
-  } catch {
-    state.session = null
-  }
-  render()
+
+    const orderRecord: OrderRecord = {
+      distributorId: state.session!.distributorId,
+      id: `ord_${crypto.randomUUID()}`,
+      clientId: clientToUse.id,
+      clientName: clientToUse.name,
+      contactName: clientToUse.contactName,
+      clientWhatsapp: clientToUse.whatsapp,
+      distributorPhone: state.session?.phone || '',
+      distributorName: state.session?.name || 'Distribuidor',
+      items: items,
+      totalPackages: totalPackages,
+      totalAmount: items.reduce((sum, item) => sum + item.subtotal, 0),
+      paymentMethod: d.paymentMethod,
+      nextDelivery: d.nextDelivery,
+      latitude: clientToUse.latitude,
+      longitude: clientToUse.longitude,
+      status: 'pending_sync',
+      createdAt: new Date().toISOString()
+    }
+
+    // Salva localmente no IndexedDB imediatamente (Offline-first!)
+    try {
+      await saveOrder(orderRecord)
+    } catch {
+      alert('Não foi possível salvar o pedido neste aparelho. Tente novamente; nenhum comprovante foi gerado.')
+      return
+    }
+
+    // Atualiza data do último pedido no cadastro do cliente para o termômetro de recompra
+    clientToUse.lastOrderDate = orderRecord.createdAt
+    await saveClient(clientToUse)
+    hapticFeedback(100)
+
+    // Atualiza resumos
+    await refreshData()
+
+    // Notifica instantaneamente a fábrica em tempo real (assíncrono)
+    broadcastSyncMessage({ type: 'ORDER_CREATED', order: orderRecord })
+
+    // Dispara sync em background com o servidor REST
+    void syncPendingData()
+
+    state.completedOrder = orderRecord
+    state.currentScreen = 'receipt'
+    render()
+  })
 }
 
-async function loadHistory(message = ''): Promise<void> {
-  if (!state.session || !state.selectedClient || !state.storage) {
-    state.history = []
-    render(message)
+// ==========================
+// TELA 3: COMPROVANTE E COMPARTILHAMENTO
+// ==========================
+function renderReceiptScreen() {
+  const o = state.completedOrder
+  if (!o) {
+    state.currentScreen = 'home'
+    render()
     return
   }
-  try {
-    state.history = await state.storage.history(state.session.distributorId, state.selectedClient.id)
-    render(message)
-  } catch (error) {
-    state.history = []
-    render(error instanceof Error ? error.message : 'Não foi possível carregar o histórico.')
+
+  const formattedTotal = o.totalAmount.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })
+  const isPix = o.paymentMethod === 'PIX_A_VISTA'
+  const paymentLabel = isPix ? 'À Vista / Pix' : 'Faturado / Boleto'
+
+  const stampClass = isPix ? 'pix' : 'boleto'
+  const stampText = isPix ? '✓ PIX CONFIRMADO - À VISTA' : '📄 A FATURAR - BOLETO'
+
+  const itemsListHTML = o.items.map((i) => {
+    return `
+      <div class="receipt-item-row">
+        <span><strong>${i.quantity}x</strong> ${i.name}</span>
+        <span>R$ ${i.subtotal.toFixed(2)}</span>
+      </div>
+    `
+  }).join('')
+
+  appRoot.innerHTML = `
+    ${createHeaderHTML()}
+    <div class="screen-container">
+      <div style="text-align:center; margin-bottom:2px;">
+        <h2 style="font-size:24px; font-weight:900; color:var(--treali-green-dark); letter-spacing:-0.5px;">
+          Pedido Concluído com Sucesso!
+        </h2>
+        <p style="font-size:14px; color:var(--text-muted); font-weight:600; margin-top:2px;">
+          Gravado no aparelho e pronto para envio
+        </p>
+      </div>
+
+      <!-- COMPROVANTE MODERNO TIPO NOTA / TICKET -->
+      <div class="receipt-card">
+        <div class="receipt-header">
+          <div class="receipt-stamp ${stampClass}">
+            ${stampText}
+          </div>
+          <div class="receipt-title">TREALI ALIMENTOS</div>
+          <div class="receipt-client">${o.clientName}</div>
+          <div class="receipt-client-info">Resp: ${o.contactName} • Tel: ${o.clientWhatsapp}</div>
+        </div>
+
+        <div class="receipt-items">
+          ${itemsListHTML}
+        </div>
+
+        <div class="receipt-total-row">
+          <span>TOTAL</span>
+          <span class="receipt-total-value">${formattedTotal}</span>
+        </div>
+
+        <div class="receipt-meta">
+          <div>💳 Pagamento: <strong>${paymentLabel}</strong></div>
+          <div>🚚 Próxima Entrega: <strong>${o.nextDelivery}</strong></div>
+          <div>🕒 Data: <strong>${new Date(o.createdAt).toLocaleDateString('pt-BR')} às ${new Date(o.createdAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</strong></div>
+          <div>🛵 Distribuidor: <strong>${o.distributorName}</strong></div>
+          ${o.latitude ? `<div>📍 Localização GPS: <strong>${o.latitude.toFixed(4)}, ${o.longitude?.toFixed(4)}</strong></div>` : ''}
+        </div>
+      </div>
+
+      <!-- BOTÃO HERO GIGANTE DE WHATSAPP -->
+      <button id="btn-send-whatsapp" class="btn-huge btn-success" style="height:66px; font-size:20px;">
+        ${icons.whatsapp} ENVIAR RECIBO NO WHATSAPP
+      </button>
+
+      <!-- BOTÃO VOLTAR PARA A ROTA -->
+      <button id="btn-back-route" class="btn-huge btn-secondary" style="font-size:16px;">
+        ${icons.arrowLeft} Concluir e Voltar para a Rota
+      </button>
+    </div>
+  `
+
+  bindHeaderEvents()
+
+  document.getElementById('btn-send-whatsapp')?.addEventListener('click', () => {
+    hapticFeedback(60)
+    const msg = buildReceiptMessage(o)
+    openWhatsApp(o.clientWhatsapp, msg)
+  })
+
+  document.getElementById('btn-back-route')?.addEventListener('click', () => {
+    hapticFeedback(40)
+    state.completedOrder = null
+    state.currentScreen = 'home'
+    render()
+  })
+}
+
+// ==========================
+// REGISTRO DE SERVICE WORKER RESILIENTE
+// ==========================
+function registerServiceWorker() {
+  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return
+
+  // Em modo de desenvolvimento (Vite dev), desregistra qualquer ServiceWorker antigo
+  // para evitar interceptação de arquivos em cache e telas brancas
+  if (import.meta.env.DEV) {
+    navigator.serviceWorker.getRegistrations().then((registrations) => {
+      for (const reg of registrations) {
+        reg.unregister().catch(() => {})
+      }
+    }).catch(() => {})
+
+    if (typeof caches !== 'undefined') {
+      caches.keys().then((keys) => {
+        for (const k of keys) {
+          caches.delete(k).catch(() => {})
+        }
+      }).catch(() => {})
+    }
+    return
+  }
+
+  // Em produção (build final), registra o PWA Service Worker
+  if (import.meta.env.PROD && window.location.protocol.startsWith('http')) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/service-worker.js').catch((err) => {
+        console.warn('Aviso no ServiceWorker:', err)
+      })
+    })
   }
 }
 
-void bootstrap()
+// ==========================
+// INICIALIZAÇÃO DO APP (RENDER-FIRST IMEDIATO)
+// ==========================
+async function initApp() {
+  registerServiceWorker()
 
-document.addEventListener('keydown', (event) => {
-  if (event.key !== 'Escape') return
-  if (state.newClient) closeNewClient()
-  else closeMenu()
-})
+  state.currentScreen = 'login'
+  render()
+
+  // 2. Conecta listener de sincronização
+  try {
+    initSyncEngine()
+    subscribeSyncMessages(async (msg) => {
+      if (msg.type === 'CATALOG_UPDATED') {
+        await refreshData()
+        render()
+      } else if (msg.type === 'DISTRIBUTORS_UPDATED') {
+        void syncPendingData()
+      } else if (msg.type === 'ORDER_SYNCED') {
+        await refreshData()
+      }
+    })
+    onSyncStatusChange((syncStatus, pendingCount) => {
+      state.syncStatus = syncStatus
+      state.pendingSyncCount = pendingCount
+      if (syncStatus === 'idle' || syncStatus === 'synced') {
+        void refreshData().then(() => { if (state.currentScreen === 'order') render() })
+      }
+      const badge = document.querySelector('.sync-badge')
+      if (badge) {
+        if (syncStatus === 'syncing') {
+          badge.className = 'sync-badge syncing'
+          badge.innerHTML = `${icons.refresh} <span>Sincronizando...</span>`
+        } else if (pendingCount > 0) {
+          badge.className = 'sync-badge offline'
+          badge.innerHTML = `${icons.check} <span>${pendingCount} pendente(s)</span>`
+        } else {
+          badge.className = 'sync-badge online'
+          badge.innerHTML = `${icons.check} <span>Online</span>`
+        }
+      }
+    })
+  } catch (err) {
+    console.warn('Aviso no motor de sincronização:', err)
+  }
+
+  // O catálogo só é carregado após a sessão ser verificada.
+  try {
+    const verifiedSession = await checkCurrentSession()
+    if (verifiedSession) {
+      state.session = verifiedSession
+      state.currentScreen = 'home'
+      try { await pullRemoteCatalog() } catch { /* offline: usa cache do distribuidor verificado */ }
+    }
+  } catch (err) {
+    console.warn('Aviso ao verificar sessão:', err)
+  }
+
+  // 4. Atualiza os dados da rota e placar diário
+  if (state.session) {
+    try {
+      await refreshData()
+    } catch (err) {
+      console.warn('Aviso ao atualizar dados:', err)
+    }
+  }
+
+  // Re-renderiza com os dados consolidados do banco
+  render()
+
+  // 5. Tenta sync suave em segundo plano
+  void syncPendingData()
+}
+
+// Inicia aplicação
+void initApp()

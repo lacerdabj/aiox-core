@@ -1,28 +1,18 @@
 {
-  "name": "treali-distributors-pwa",
-  "version": "0.1.0",
+  "name": "treali-pwa-rua",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build && node scripts/verify-build.mjs",
+    "start": "node --import tsx server/start.ts",
+    "build": "vite build",
     "preview": "vite preview",
-    "lint": "eslint . --max-warnings=0",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/**/*.test.ts && node tests/verify-storage-policy.mjs",
-    "test:e2e": "python3 tests/e2e/treali-e2e.py",
-    "import:catalogs": "node scripts/import-catalogs.mjs",
-    "hash:password": "node scripts/create-password-hash.mjs"
-  },
-  "dependencies": {
-    "@sqlite.org/sqlite-wasm": "3.53.4-build1"
+    "test": "node --import tsx --test tests/**/*.test.ts"
   },
   "devDependencies": {
-    "@eslint/js": "^9.39.1",
     "@types/node": "^24.10.0",
-    "@typescript-eslint/eslint-plugin": "^8.47.0",
-    "@typescript-eslint/parser": "^8.47.0",
-    "eslint": "^9.39.1",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3",
     "vite": "^8.3.1"
