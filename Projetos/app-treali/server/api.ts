@@ -69,12 +69,14 @@ async function body(req: IncomingMessage): Promise<Row> {
   } catch { throw error(400, 'JSON inválido') }
 }
 
-export function createTrealiApi(options: { dbPath?: string; adminPassword?: string; localTestAdmin?: boolean } = {}) {
-  const dbPath = options.dbPath ?? resolve(process.cwd(), '.treali-data/treali.sqlite')
+export function createTrealiApi(options: { dbPath?: string; adminPassword?: string; localTestAdmin?: boolean; seedDefaultData?: boolean } = {}) {
+  const isVercel = Boolean(process.env.VERCEL)
+  const defaultDbPath = isVercel ? '/tmp/treali.sqlite' : resolve(process.cwd(), '.treali-data/treali.sqlite')
+  const dbPath = options.dbPath ?? defaultDbPath
   const configuredPassword = options.adminPassword ?? process.env.TREALI_ADMIN_PASSWORD
   const localTestAdmin = options.localTestAdmin === true && configuredPassword === undefined
-  const adminPassword = localTestAdmin ? '123456' : configuredPassword
-  if (!adminPassword || (!localTestAdmin && adminPassword.length < 12)) throw new Error('Defina TREALI_ADMIN_PASSWORD com pelo menos 12 caracteres antes de iniciar o servidor')
+  const adminPassword = localTestAdmin ? '123456' : (configuredPassword ?? (isVercel ? '123456' : undefined))
+  if (!adminPassword || (!localTestAdmin && !isVercel && adminPassword.length < 12)) throw new Error('Defina TREALI_ADMIN_PASSWORD com pelo menos 12 caracteres antes de iniciar o servidor')
   mkdirSync(dirname(dbPath), { recursive: true })
   if (existsSync(resolve(dirname(dbPath), 'db.json')) && !existsSync(dbPath)) {
     console.warn('Treali: db.json legado preservado. SQLite novo não importa PINs ou identidades automaticamente; veja server/README.md.')
@@ -87,6 +89,11 @@ export function createTrealiApi(options: { dbPath?: string; adminPassword?: stri
     CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, distributor_id TEXT NOT NULL REFERENCES distributors(id), data TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, role TEXT NOT NULL, distributor_id TEXT, expires_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS mutations (distributor_id TEXT NOT NULL, mutation_id TEXT NOT NULL, product_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(distributor_id, mutation_id));`)
+  const getClientIp = (req: IncomingMessage) => {
+    const forwarded = req.headers['x-forwarded-for']
+    if (typeof forwarded === 'string') return forwarded.split(',')[0].trim()
+    return req.socket?.remoteAddress ?? 'unknown'
+  }
   const adminHash = hashSecret(adminPassword)
   const failures = new Map<string, { count: number; until: number }>()
   const limitLogin = (key: string, valid: boolean) => {
@@ -105,6 +112,41 @@ export function createTrealiApi(options: { dbPath?: string; adminPassword?: stri
     try { const result = work(); db.exec('COMMIT'); return result }
     catch (err) { db.exec('ROLLBACK'); throw err }
   }
+
+  const seedIfEmpty = () => {
+    const count = get('SELECT COUNT(*) as count FROM products')
+    if (count && Number(count.count) > 0) return
+
+    const defaultProducts = [
+      { id: 'bacon_30g', name: 'Bacon 30G', shortLabel: 'Bacon', sortOrder: 0, isActive: true, updatedAt: new Date().toISOString() },
+      { id: 'creme_alho_30g', name: 'Creme de Alho 30G', shortLabel: 'Creme de Alho', sortOrder: 1, isActive: true, updatedAt: new Date().toISOString() },
+      { id: 'tradicional_30g', name: 'Tradicional 30G', shortLabel: 'Tradicional', sortOrder: 2, isActive: true, updatedAt: new Date().toISOString() },
+      { id: 'picante_30g', name: 'Picante 30G', shortLabel: 'Picante', sortOrder: 3, isActive: true, updatedAt: new Date().toISOString() }
+    ]
+
+    for (const p of defaultProducts) {
+      run('INSERT INTO products (id, data) VALUES (?, ?)', p.id, JSON.stringify(p))
+    }
+
+    const defaultDistributors = [
+      { id: 'dist_carlos', name: 'Distribuidor Carlos', phone: '32988112233', city: 'Muriaé', vehicle: 'Moto Honda CG 160', vehiclePlate: 'ABC-1234', isActive: true, pin: '1234', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+      { id: 'dist_renato', name: 'Distribuidor Renato', phone: '32977445566', city: 'Muriaé', vehicle: 'Moto Yamaha Fazer', vehiclePlate: 'DEF-5678', isActive: true, pin: '1234', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+      { id: 'dist_marcos', name: 'Distribuidor Marcos', phone: '32999887766', city: 'Muriaé', vehicle: 'Fiorino 1.4', vehiclePlate: 'GHI-9012', isActive: true, pin: '1234', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+    ]
+
+    for (const d of defaultDistributors) {
+      const { pin, ...distData } = d
+      run('INSERT INTO distributors (id, phone, data, pin_hash) VALUES (?, ?, ?, ?)', d.id, d.phone, JSON.stringify(distData), hashSecret(pin))
+      for (const p of defaultProducts) {
+        run('INSERT INTO prices (distributor_id, product_id, enabled, purchase_cents, resale_cents, revision) VALUES (?, ?, 1, 2850, 3800, 1)', d.id, p.id)
+      }
+    }
+  }
+
+  if (options.seedDefaultData || isVercel) {
+    seedIfEmpty()
+  }
+
   const session = (req: IncomingMessage): Session | null => {
     const token = /(?:^|;\s*)treali_session=([^;]+)/.exec(req.headers.cookie ?? '')?.[1]
     if (!token) return null
@@ -120,7 +162,8 @@ export function createTrealiApi(options: { dbPath?: string; adminPassword?: stri
   const setSession = (res: ServerResponse, role: Role, distributorId: string | null) => {
     const token = randomBytes(32).toString('hex')
     run('INSERT INTO sessions VALUES (?,?,?,?)', digest(token), role, distributorId, Date.now() + 30 * 86400000)
-    res.setHeader('Set-Cookie', `treali_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${process.env.TREALI_SECURE_COOKIE === '1' ? '; Secure' : ''}`)
+    const isSecure = process.env.TREALI_SECURE_COOKIE === '1' || isVercel
+    res.setHeader('Set-Cookie', `treali_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${isSecure ? '; Secure' : ''}`)
   }
   const prices = () => all('SELECT distributor_id,product_id,enabled,purchase_cents,resale_cents,revision FROM prices').map(row => ({ distributorId: row.distributor_id, productId: row.product_id, enabled: !!row.enabled, purchasePrice: plainMoney(row.purchase_cents), resalePrice: plainMoney(row.resale_cents), revision: row.revision }))
   const products = () => all('SELECT data FROM products').map(row => JSON.parse(row.data as string) as Row).sort((a, b) => Number(a.sortOrder ?? 9999) - Number(b.sortOrder ?? 9999))
@@ -131,7 +174,7 @@ export function createTrealiApi(options: { dbPath?: string; adminPassword?: stri
     if (!path.startsWith('/api/')) return false
     try {
       if (localTestAdmin) {
-        const address = req.socket.remoteAddress
+        const address = getClientIp(req)
         const host = req.headers.host ?? ''
         if (!isLocalOrPrivateAddress(address) || !isLocalOrPrivateHost(host)) {
           throw error(403, 'Acesso de teste permitido somente em ambiente local ou rede privada')
@@ -140,12 +183,25 @@ export function createTrealiApi(options: { dbPath?: string; adminPassword?: stri
       if (!['GET', 'POST', 'PATCH'].includes(req.method ?? '')) throw error(405, 'Método não permitido')
       if (req.method !== 'GET') {
         const origin = req.headers.origin
-        const host = req.headers.host
-        if (origin && (!host || new URL(origin).host !== host)) throw error(403, 'Origem não permitida')
+        const forwardedHost = req.headers['x-forwarded-host']
+        const host = typeof forwardedHost === 'string' ? forwardedHost : req.headers.host
+        if (origin) {
+          try {
+            const originHost = new URL(origin).host
+            const isAllowed = (host && originHost === host) ||
+                              (req.headers.host && originHost === req.headers.host) ||
+                              originHost.endsWith('.vercel.app') ||
+                              isLocalOrPrivateHost(originHost)
+            if (!isAllowed) throw error(403, 'Origem não permitida')
+          } catch (e: any) {
+            if (e.status === 403) throw e
+            throw error(403, 'Origem inválida')
+          }
+        }
       }
       if (path === '/api/auth/admin-login' && req.method === 'POST') {
         const input = await body(req)
-        limitLogin(`admin:${req.socket.remoteAddress}`, input.username === 'Admin' && typeof input.password === 'string' && verifySecret(input.password, adminHash))
+        limitLogin(`admin:${getClientIp(req)}`, input.username === 'Admin' && typeof input.password === 'string' && verifySecret(input.password, adminHash))
         setSession(res, 'admin', null)
         json(res, 200, { role: 'admin' }); return true
       }
@@ -153,7 +209,7 @@ export function createTrealiApi(options: { dbPath?: string; adminPassword?: stri
         const input = await body(req)
         const phone = string(input.phone, 'Telefone').replace(/\D/g, '')
         const row = get('SELECT id,data,pin_hash FROM distributors WHERE phone=?', phone)
-        limitLogin(`dist:${req.socket.remoteAddress}:${phone}`, !!row && typeof input.pin === 'string' && verifySecret(input.pin, row.pin_hash as string) && !!(JSON.parse(row.data as string) as Row).isActive)
+        limitLogin(`dist:${getClientIp(req)}:${phone}`, !!row && typeof input.pin === 'string' && verifySecret(input.pin, row.pin_hash as string) && !!(JSON.parse(row.data as string) as Row).isActive)
         if (!row) throw error(401, 'Credenciais inválidas')
         setSession(res, 'distributor', row.id as string)
         json(res, 200, { role: 'distributor', distributorId: row.id }); return true

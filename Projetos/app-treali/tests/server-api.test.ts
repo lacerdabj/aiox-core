@@ -113,3 +113,46 @@ test('SQLite API isolates distributors, persists prices, rejects invalid money a
     api.close()
   }
 })
+
+test('Vercel serverless environment: auto-seed, default 123456 admin, and origin header support', async () => {
+  const previousVercel = process.env.VERCEL
+  const dbPath = join(mkdtempSync(join(tmpdir(), 'treali-vercel-')), 'treali.sqlite')
+  process.env.VERCEL = '1'
+  try {
+    const api = createTrealiApi({ dbPath })
+    const server = createServer((req, res) => { void api.handle(req, res) })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`
+    try {
+      // 1. Admin login with 123456 and origin from .vercel.app
+      const loginRes = await fetch(base + '/api/auth/admin-login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Origin: 'https://app-treali.vercel.app'
+        },
+        body: JSON.stringify({ username: 'Admin', password: '123456' })
+      })
+      assert.equal(loginRes.status, 200)
+      const cookie = loginRes.headers.get('set-cookie')!
+      assert.match(cookie, /treali_session=/)
+
+      // 2. Catalog is automatically populated with default products and distributors
+      const catalogRes = await fetch(base + '/api/admin/catalog', {
+        headers: { Cookie: cookie.split(';')[0] }
+      })
+      assert.equal(catalogRes.status, 200)
+      const catalog = await catalogRes.json() as { products: unknown[]; distributors: unknown[]; prices: unknown[] }
+      assert.equal(catalog.products.length, 4)
+      assert.equal(catalog.distributors.length, 3)
+      assert.equal(catalog.prices.length, 12)
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()))
+      api.close()
+    }
+  } finally {
+    if (previousVercel === undefined) delete process.env.VERCEL
+    else process.env.VERCEL = previousVercel
+  }
+})
+
