@@ -1,15 +1,20 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { createTrealiApi } from '../server/api.ts'
 
-let apiInstance: any = null
+let apiInstance: ReturnType<typeof createTrealiApi> | null = null
+
+function getApi() {
+  if (!apiInstance) {
+    apiInstance = createTrealiApi({
+      seedDefaultData: true
+    })
+  }
+  return apiInstance
+}
 
 export default async function handler(req: IncomingMessage, res: ServerResponse) {
   try {
-    if (!apiInstance) {
-      const { createTrealiApi } = await import('../server/api.ts')
-      apiInstance = createTrealiApi({
-        seedDefaultData: true
-      })
-    }
+    const api = getApi()
 
     if (req.url) {
       const parsed = new URL(req.url, 'http://localhost')
@@ -28,7 +33,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
       }
     }
 
-    const handled = await apiInstance.handle(req, res)
+    const handled = await api.handle(req, res)
     if (!handled && !res.writableEnded) {
       res.statusCode = 404
       res.setHeader('Content-Type', 'application/json; charset=utf-8')
