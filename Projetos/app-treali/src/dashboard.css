@@ -1,3 +1,5 @@
+@import "./theme.css";
+
 :root {
   --bg-page: #F1F5F9;
   --bg-card: #FFFFFF;

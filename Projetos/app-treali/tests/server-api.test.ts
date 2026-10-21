@@ -124,14 +124,14 @@ test('Vercel serverless environment: auto-seed, default 123456 admin, and origin
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
     const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`
     try {
-      // 1. Admin login with 123456 and origin from .vercel.app
+      // 1. Admin login with 123456 (case-insensitive username 'admin') and origin from .vercel.app
       const loginRes = await fetch(base + '/api/auth/admin-login', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Origin: 'https://app-treali.vercel.app'
         },
-        body: JSON.stringify({ username: 'Admin', password: '123456' })
+        body: JSON.stringify({ username: 'admin', password: '123456' })
       })
       assert.equal(loginRes.status, 200)
       const cookie = loginRes.headers.get('set-cookie')!

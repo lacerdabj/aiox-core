@@ -1,3 +1,5 @@
+@import "./theme.css";
+
 :root {
   /* TEMA CLARO DE ALTO CONTRASTE EXTREMO - REGRA DO DEDO GORDO NO SOL */
   --bg-app: #F8FAFC;

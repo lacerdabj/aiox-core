@@ -282,9 +282,6 @@ function createHeaderHTML(): string {
           ${syncBadgeClass === 'syncing' ? icons.refresh : icons.check}
           <span>${syncBadgeText}</span>
         </div>
-        <a href="/dashboard.html" class="btn-icon-header" title="Abrir Painel da Fábrica" aria-label="Painel da Fábrica" style="text-decoration:none; display:flex; align-items:center; justify-content:center; font-size:16px;">
-          🏢
-        </a>
         <button id="btn-logout" class="btn-icon-header" title="Sair da Conta" aria-label="Sair">
           ${icons.logout}
         </button>

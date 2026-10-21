@@ -3,10 +3,13 @@
   "short_name": "Treali Rua",
   "description": "App para revendedor e distribuidor Treali na rota de entregas e novos pedidos.",
   "start_url": "/",
+  "scope": "/",
+  "id": "/",
   "display": "standalone",
-  "background_color": "#0F172A",
-  "theme_color": "#F59E0B",
-  "orientation": "portrait-primary",
+  "display_override": ["fullscreen", "standalone", "window-controls-overlay"],
+  "background_color": "#F8FAFC",
+  "theme_color": "#F8FAFC",
+  "orientation": "portrait",
   "icons": [
     {
       "src": "/icons/icon-192.svg",

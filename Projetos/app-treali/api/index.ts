@@ -201,7 +201,8 @@ export function createTrealiApi(options: { dbPath?: string; adminPassword?: stri
       }
       if (path === '/api/auth/admin-login' && req.method === 'POST') {
         const input = await body(req)
-        limitLogin(`admin:${getClientIp(req)}`, input.username === 'Admin' && typeof input.password === 'string' && verifySecret(input.password, adminHash))
+        const isAdminUser = typeof input.username === 'string' && input.username.trim().toLowerCase() === 'admin'
+        limitLogin(`admin:${getClientIp(req)}`, isAdminUser && typeof input.password === 'string' && verifySecret(input.password, adminHash))
         setSession(res, 'admin', null)
         json(res, 200, { role: 'admin' }); return true
       }

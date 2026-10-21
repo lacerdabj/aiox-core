@@ -1,0 +1,26 @@
+@import "tailwindcss";
+
+@theme {
+  --color-treali-yellow: #F59E0B;
+  --color-treali-yellow-dark: #D97706;
+  --color-treali-yellow-deep: #B45309;
+  --color-treali-yellow-light: #FEF3C7;
+  --color-treali-yellow-border: #FCD34D;
+
+  --color-treali-green: #16A34A;
+  --color-treali-green-dark: #15803D;
+  --color-treali-green-light: #DCFCE7;
+  --color-treali-green-border: #86EFAC;
+
+  --color-treali-blue: #2563EB;
+  --color-treali-blue-dark: #1D4ED8;
+  --color-treali-blue-light: #EFF6FF;
+  --color-treali-blue-border: #BFDBFE;
+
+  --color-treali-red: #DC2626;
+  --color-treali-red-light: #FEE2E2;
+  --color-treali-red-border: #FCA5A5;
+
+  --spacing-touch: 56px;
+  --spacing-touch-lg: 64px;
+}
